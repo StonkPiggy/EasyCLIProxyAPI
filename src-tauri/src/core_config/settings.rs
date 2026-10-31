@@ -26,7 +26,8 @@ pub(crate) fn validate_api_key_remark(remark: &str) -> Result<(), String> {
 pub(crate) fn validate_api_access_provider_section(section: &str) -> Result<(), String> {
     if matches!(
         section,
-        "gemini-api-key" | "codex-api-key" | "claude-api-key" | "openai-compatibility"
+        "gemini-api-key" | "interactions-api-key" | "vertex-api-key" | "codex-api-key"
+            | "claude-api-key" | "xai-api-key" | "meta-api-key" | "openai-compatibility"
     ) {
         Ok(())
     } else {
@@ -44,6 +45,10 @@ pub(crate) fn usage_provider_section(provider: &str) -> Option<&'static str> {
         "codex" => Some("codex-api-key"),
         "claude" => Some("claude-api-key"),
         "gemini" | "aistudio" => Some("gemini-api-key"),
+        "interactions" => Some("interactions-api-key"),
+        "vertex" | "vertex-ai" => Some("vertex-api-key"),
+        "xai" | "grok" => Some("xai-api-key"),
+        "meta" => Some("meta-api-key"),
         "openai" | "openai-compatibility" => Some("openai-compatibility"),
         _ => None,
     }
@@ -97,36 +102,40 @@ pub(crate) fn validate_strong_management_secret_key(secret_key: &str) -> Result<
     if secret_key.trim().is_empty() {
         return Err("WebUI key cannot be empty".to_string());
     }
-    if secret_key.trim() == LEGACY_DEFAULT_MANAGEMENT_SECRET_KEY {
-        return Err("The legacy default WebUI key 123456 cannot be used".to_string());
-    }
     if is_hashed_management_secret_key(secret_key) {
         return Err("GUI configuration must save a plaintext WebUI key that can authenticate with the management interface".to_string());
     }
     Ok(())
 }
 
-pub(crate) fn generate_management_secret_key() -> Result<String, String> {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-
-    let mut random = [0_u8; 32];
-    getrandom::fill(&mut random).map_err(|error| format!("Failed to generate WebUI security key: {error}"))?;
-    Ok(format!("wui-Aa9_{}", URL_SAFE_NO_PAD.encode(random)))
-}
-
-pub(crate) fn management_secret_requires_rotation(secret_key: &str) -> bool {
-    let secret_key = secret_key.trim();
-    secret_key.is_empty()
-        || secret_key == LEGACY_DEFAULT_MANAGEMENT_SECRET_KEY
-        || is_hashed_management_secret_key(secret_key)
-}
-
-pub(crate) fn ensure_strong_management_secret(config: &mut GuiConfigFile) -> Result<bool, String> {
-    if !management_secret_requires_rotation(&config.management_secret_key) {
-        return Ok(false);
+// A hashed kernel value cannot supply a request credential. If the GUI saved
+// an empty key while the kernel still has an enabled key, recover both sides
+// to the same usable credential. A disabled kernel stays disabled.
+pub(crate) fn recover_management_secret(
+    imported: &str,
+    saved: Option<&str>,
+    kernel_key: Option<&str>,
+) -> String {
+    if validate_strong_management_secret_key(imported).is_ok() {
+        return imported.trim().to_string();
     }
-    config.management_secret_key = generate_management_secret_key()?;
-    Ok(true)
+    if let Some(saved) = saved {
+        if validate_strong_management_secret_key(saved).is_ok() {
+            return saved.trim().to_string();
+        }
+        if saved.is_empty() {
+            if let Some(kernel_key) = kernel_key {
+                if validate_strong_management_secret_key(kernel_key).is_ok() {
+                    return kernel_key.trim().to_string();
+                }
+                if is_hashed_management_secret_key(kernel_key) {
+                    return LEGACY_DEFAULT_MANAGEMENT_SECRET_KEY.to_string();
+                }
+            }
+            return String::new();
+        }
+    }
+    LEGACY_DEFAULT_MANAGEMENT_SECRET_KEY.to_string()
 }
 
 pub(crate) fn normalize_management_secret_key(secret_key: String) -> Result<String, String> {
@@ -155,10 +164,10 @@ pub(crate) fn is_hashed_management_secret_key(secret_key: &str) -> bool {
 }
 
 pub(crate) fn validate_routing_strategy(strategy: &str) -> Result<(), String> {
-    if matches!(strategy, "round-robin" | "fill-first") {
+    if matches!(strategy, "round-robin" | "weighted-round-robin" | "fill-first") {
         return Ok(());
     }
-    Err("Routing strategy supports only round-robin or fill-first".to_string())
+    Err("Routing strategy supports round-robin, weighted-round-robin, or fill-first".to_string())
 }
 
 pub(crate) fn normalize_optional_config_string(
@@ -290,10 +299,87 @@ pub(crate) fn merge_core_config_yaml(
     config: &GuiConfigFile,
 ) -> Result<String, String> {
     let base = match current {
-        Some(current) => current.to_string(),
-        None => merge_core_config_fields(template, None)?,
+        Some(current) => {
+            let template_document: serde_norway::Value = serde_norway::from_str(template)
+                .map_err(|error| format!("Failed to parse kernel configuration template: {error}"))?;
+            if core_config_uses_v8(&template_document) {
+                migrate_legacy_core_config_to_v8(template, current)?
+            } else {
+                current.to_string()
+            }
+        }
+        None => {
+            // Only new configurations omit template plugin instances. No scan or
+            // cleanup is performed for existing installations.
+            let file = template.parse::<yaml_edit::YamlFile>()
+                .map_err(|error| format!("Failed to parse kernel configuration template: {error}"))?;
+            let root = file.document().and_then(|document| document.as_mapping())
+                .ok_or_else(|| "Kernel configuration template root must be a YAML mapping".to_string())?;
+            if let Some(value) = root.get("plugins") {
+                if let Some(plugins) = value.as_mapping() {
+                    plugins.remove("configs");
+                }
+            }
+            merge_core_config_fields(&file.to_string(), None)?
+        },
     };
-    apply_gui_managed_settings(&base, config)
+    // Old mirrored values may be stale after a kernel upgrade. Only an explicit
+    // software-side opt-out should disable statistics when starting the kernel.
+    let mut startup_config = config.clone();
+    // Preserve an explicit kernel choice, including false (cooling enabled).
+    // Read the existing file before template migration can inject defaults.
+    if let Some(current) = current {
+        let document: serde_norway::Value = serde_norway::from_str(current)
+            .map_err(|error| format!("Failed to parse kernel configuration: {error}"))?;
+        startup_config.disable_cooling = core_config_settings_from_value(&document)?.disable_cooling;
+    }
+    startup_config.usage_statistics_enabled = config.usage_statistics_disabled != Some(true);
+    let managed = apply_gui_managed_settings(&base, &startup_config)?;
+    let codex_compatibility_config = current
+        .and_then(|content| serde_norway::from_str::<serde_norway::Value>(content).ok());
+    let managed = patch_core_yaml_document(&managed, |document| {
+        for field in ["enable-apply-patch", "optimize-multi-agent-v2"] {
+            let explicitly_configured = codex_compatibility_config
+                .as_ref()
+                .and_then(serde_norway::Value::as_mapping)
+                .is_some_and(|root| [
+                    vec!["client", "codex", field],
+                    vec!["oauth", "providers", "codex", field],
+                    vec!["providers", "codex", field],
+                    vec!["codex", field],
+                ].iter().any(|path| nested_yaml_value(root, path).is_some()));
+            if !explicitly_configured {
+                set_core_yaml_schema_value(document, &["client", "codex", field], &["client", "codex", field], serde_norway::Value::Bool(true))?;
+            }
+        }
+        if config.image_generation_user_selected { return Ok(false); }
+        let Some(root) = document.as_mapping() else { return Ok(false); };
+        let has_codex_keys = nested_yaml_value(root, &["api-keys", "codex"])
+            .and_then(serde_norway::Value::as_sequence)
+            .is_some_and(|groups| groups.iter().any(|group| {
+                group.get("keys").and_then(serde_norway::Value::as_sequence)
+                    .is_some_and(|keys| !keys.is_empty())
+            }))
+            || yaml_mapping_value(root, "codex-api-key")
+                .and_then(serde_norway::Value::as_sequence)
+                .is_some_and(|keys| !keys.is_empty());
+        let image_mode = nested_yaml_value(root, &["multimedia", "disable-image-generation"])
+            .or_else(|| yaml_mapping_value(root, "disable-image-generation"));
+        let auto_injects = image_mode.is_none_or(|value| {
+            value.is_null() || value.as_bool() == Some(false)
+                || value.as_str().is_some_and(|mode| {
+                    matches!(mode.trim().to_ascii_lowercase().as_str(), "" | "false" | "0" | "off" | "no")
+                })
+        });
+        if !has_codex_keys || !auto_injects { return Ok(false); }
+        set_core_yaml_schema_value(
+            document,
+            &["disable-image-generation"],
+            &["multimedia", "disable-image-generation"],
+            serde_norway::Value::String("chat".into()),
+        )
+    })?.unwrap_or(managed);
+    sanitize_unsupported_provider_disabled_yaml(&managed)
 }
 
 pub(crate) fn merge_core_config_fields(
@@ -601,12 +687,30 @@ pub(crate) fn apply_gui_managed_settings(
             &["observability", "logs", "request-log"],
             serde_norway::Value::Bool(config.request_log),
         )?;
-        changed |= set_core_yaml_schema_value(
-            document,
-            &["remote-management", "secret-key"],
-            &["management", "secret-key"],
-            serde_norway::Value::String(config.management_secret_key.clone()),
-        )?;
+        // v8 kernels persist this credential as a bcrypt/argon2 hash after a
+        // successful start. It is already the canonical value the kernel
+        // expects; replacing it with the GUI plaintext needlessly enters the
+        // format-preserving YAML editor and can produce a duplicate top-level
+        // `management` mapping for some valid config layouts.
+        let stored_management_key = document
+            .as_mapping()
+            .and_then(|root| nested_yaml_value(root, &["management", "secret-key"]))
+            .or_else(|| {
+                document.as_mapping().and_then(|root| {
+                    nested_yaml_value(root, &["remote-management", "secret-key"])
+                })
+            });
+        if !stored_management_key
+            .and_then(serde_norway::Value::as_str)
+            .is_some_and(is_hashed_management_secret_key)
+        {
+            changed |= set_core_yaml_schema_value(
+                document,
+                &["remote-management", "secret-key"],
+                &["management", "secret-key"],
+                serde_norway::Value::String(config.management_secret_key.clone()),
+            )?;
+        }
         changed |= set_core_yaml_nested_value(
             document,
             "plugins",
@@ -765,6 +869,7 @@ pub(crate) fn consume_software_write(path: &Path) -> bool {
         .is_some_and(|expected_hash| expected_hash == hash)
 }
 
+#[cfg(test)]
 pub(crate) fn write_yaml_if_changed(path: &Path, content: &str) -> Result<bool, String> {
     if fs::read_to_string(path).ok().as_deref() == Some(content) {
         return Ok(false);
@@ -1324,6 +1429,8 @@ pub(crate) fn load_or_create_gui_config() -> Result<GuiConfigFile, String> {
         )
     };
 
+    let saved_management_secret = presence.management_secret_key.as_deref();
+
     if gui_config_exists {
         if let Ok(content) = fs::read_to_string(&config_path) {
             changed |= [
@@ -1428,8 +1535,7 @@ pub(crate) fn load_or_create_gui_config() -> Result<GuiConfigFile, String> {
                 config.management_secret_key = core_settings
                     .management_secret_key
                     .as_deref()
-                    .filter(|secret_key| !is_hashed_management_secret_key(secret_key))
-                    .unwrap_or_default()
+                    .unwrap_or(&config.management_secret_key)
                     .to_string();
             }
             if presence.routing_strategy.is_none() {
@@ -1469,8 +1575,7 @@ pub(crate) fn load_or_create_gui_config() -> Result<GuiConfigFile, String> {
         config.management_secret_key = read_installed_core_config_settings()
             .ok()
             .and_then(|settings| settings.management_secret_key)
-            .filter(|secret_key| !is_hashed_management_secret_key(secret_key))
-            .unwrap_or_default();
+            .unwrap_or_else(|| config.management_secret_key.clone());
         changed = true;
     }
     if presence.host.is_none() || presence.auth_dir.is_none() {
@@ -1512,7 +1617,20 @@ pub(crate) fn load_or_create_gui_config() -> Result<GuiConfigFile, String> {
         presence.proxy_override.is_some(),
     );
     config.prefer_gitcode_downloads = config.download_source == VersionDownloadSource::Gitcode;
-    let management_secret_rotated = ensure_strong_management_secret(&mut config)?;
+    let installed_management_secret = if saved_management_secret == Some("") {
+        read_installed_core_config_settings()
+            .ok()
+            .and_then(|settings| settings.management_secret_key)
+    } else {
+        None
+    };
+    let recovered_secret = recover_management_secret(
+        &config.management_secret_key,
+        saved_management_secret,
+        installed_management_secret.as_deref(),
+    );
+    let management_secret_rotated = recovered_secret != config.management_secret_key;
+    config.management_secret_key = recovered_secret;
     changed |= management_secret_rotated;
     changed |= sanitize_gui_config(&mut config)?;
     validate_gui_config(&config)?;
@@ -1652,6 +1770,129 @@ pub(crate) fn configured_window_size(config: &GuiConfigFile) -> Option<SavedWind
     }
 }
 
+pub(crate) fn configured_window_position(
+    config: &GuiConfigFile,
+) -> Option<tauri::PhysicalPosition<i32>> {
+    config
+        .window_x
+        .zip(config.window_y)
+        .map(|(x, y)| tauri::PhysicalPosition::new(x, y))
+}
+
+// Use physical coordinates for monitor layouts, including displays left of the primary.
+pub(crate) fn fit_window_position_to_work_area(
+    position: tauri::PhysicalPosition<i32>,
+    size: tauri::PhysicalSize<u32>,
+    work_area: &tauri::PhysicalRect<i32, u32>,
+) -> tauri::PhysicalPosition<i32> {
+    let clamp = |coordinate: i32, origin: i32, available: u32, length: u32| {
+        let min = i64::from(origin);
+        let max = (min + i64::from(available) - i64::from(length)).max(min);
+        i64::from(coordinate).clamp(min, max) as i32
+    };
+    tauri::PhysicalPosition::new(
+        clamp(
+            position.x,
+            work_area.position.x,
+            work_area.size.width,
+            size.width,
+        ),
+        clamp(
+            position.y,
+            work_area.position.y,
+            work_area.size.height,
+            size.height,
+        ),
+    )
+}
+
+pub(crate) fn restore_window_position_for_monitor(
+    saved_position: tauri::PhysicalPosition<i32>,
+    window_size: tauri::PhysicalSize<u32>,
+    work_area: &tauri::PhysicalRect<i32, u32>,
+    scale_factor: f64,
+) -> (tauri::PhysicalPosition<i32>, tauri::Position) {
+    let fitted_physical = fit_window_position_to_work_area(saved_position, window_size, work_area);
+    #[cfg(target_os = "macos")]
+    let target_position = if scale_factor.is_finite() && scale_factor > 0.0 {
+        tauri::Position::Logical(tauri::LogicalPosition::new(
+            f64::from(fitted_physical.x) / scale_factor,
+            f64::from(fitted_physical.y) / scale_factor,
+        ))
+    } else {
+        tauri::Position::Physical(fitted_physical)
+    };
+    #[cfg(not(target_os = "macos"))]
+    let target_position = tauri::Position::Physical(fitted_physical);
+
+    (fitted_physical, target_position)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn window_outer_size_for_monitor<R: tauri::Runtime>(
+    window: &tauri::Window<R>,
+    monitor: &tauri::Monitor,
+    expected_logical_size: Option<SavedWindowSize>,
+) -> tauri::PhysicalSize<u32> {
+    let target_scale = monitor.scale_factor();
+    if let (Ok(outer), Ok(window_scale)) = (window.outer_size(), window.scale_factor()) {
+        if window_scale.is_finite()
+            && window_scale > 0.0
+            && target_scale.is_finite()
+            && target_scale > 0.0
+        {
+            let logical_w = f64::from(outer.width) / window_scale;
+            let logical_h = f64::from(outer.height) / window_scale;
+            return tauri::PhysicalSize::new(
+                (logical_w * target_scale).round() as u32,
+                (logical_h * target_scale).round() as u32,
+            );
+        }
+    }
+    expected_logical_size
+        .map(|size| {
+            tauri::PhysicalSize::new(
+                (f64::from(size.width) * target_scale).round() as u32,
+                (f64::from(size.height) * target_scale).round() as u32,
+            )
+        })
+        .unwrap_or_else(|| window.outer_size().unwrap_or_default())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn window_outer_size_for_monitor<R: tauri::Runtime>(
+    window: &tauri::Window<R>,
+    _monitor: &tauri::Monitor,
+    _expected_logical_size: Option<SavedWindowSize>,
+) -> tauri::PhysicalSize<u32> {
+    window.outer_size().unwrap_or_default()
+}
+
+pub(crate) fn sync_main_webview_bounds(app: &tauri::AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    if let (Some(window), Some(webview)) = (main_window(app), app.get_webview("main")) {
+        let inner_size = window
+            .inner_size()
+            .map_err(|error| format!("Failed to read main window inner size: {error}"))?;
+        let scale_factor = window
+            .scale_factor()
+            .map_err(|error| format!("Failed to read main window scale factor: {error}"))?;
+        if scale_factor.is_finite() && scale_factor > 0.0 {
+            let logical_size = inner_size.to_logical::<f64>(scale_factor);
+            let bounds = tauri::Rect {
+                position: tauri::LogicalPosition::new(0.0, 0.0).into(),
+                size: tauri::LogicalSize::new(logical_size.width, logical_size.height).into(),
+            };
+            webview
+                .set_bounds(bounds)
+                .map_err(|error| format!("Failed to update main webview bounds: {error}"))?;
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = app;
+    Ok(())
+}
+
 pub(crate) fn logical_window_size_from_physical(
     physical_size: &tauri::PhysicalSize<u32>,
     scale_factor: f64,
@@ -1669,15 +1910,11 @@ pub(crate) fn logical_window_size_from_physical(
     Some(normalized_saved_window_size(width, height))
 }
 
-pub(crate) fn fit_window_size_to_current_monitor<R: tauri::Runtime>(
-    window: &tauri::WebviewWindow<R>,
+pub(crate) fn fit_window_size_to_monitor<R: tauri::Runtime>(
+    window: &tauri::Window<R>,
     saved_size: SavedWindowSize,
+    monitor: Option<&tauri::Monitor>,
 ) -> SavedWindowSize {
-    let monitor = window
-        .current_monitor()
-        .ok()
-        .flatten()
-        .or_else(|| window.primary_monitor().ok().flatten());
     let Some(monitor) = monitor else {
         return saved_size;
     };
@@ -1712,32 +1949,100 @@ pub(crate) fn fit_window_size_to_current_monitor<R: tauri::Runtime>(
     }
 }
 
-pub(crate) fn restore_main_window_size(app: &tauri::AppHandle) -> Result<(), String> {
-    let window_size_state = app.state::<MainWindowSizeState>();
-    let Some(saved_size) = window_size_state.snapshot()? else {
-        return Ok(());
-    };
-    let window = app
-        .get_webview_window("main")
-        .ok_or_else(|| "Main window does not exist; cannot restore window size".to_string())?;
-    let restored_size = fit_window_size_to_current_monitor(&window, saved_size);
+pub(crate) fn restore_main_window_geometry(app: &tauri::AppHandle) -> Result<(), String> {
+    let window_size_state = app.state::<MainWindowState>();
+    let saved_position = window_size_state.position()?;
+    let window = main_window(app)
+        .ok_or_else(|| "Main window does not exist; cannot restore window geometry".to_string())?;
+    let monitor = saved_position
+        .and_then(|position| {
+            window
+                .monitor_from_point(f64::from(position.x), f64::from(position.y))
+                .ok()
+                .flatten()
+        })
+        .or_else(|| {
+            if saved_position.is_some() {
+                window.primary_monitor().ok().flatten()
+            } else {
+                window.current_monitor().ok().flatten()
+            }
+        })
+        .or_else(|| window.primary_monitor().ok().flatten());
 
-    window
-        .set_size(LogicalSize::new(
-            f64::from(restored_size.width),
-            f64::from(restored_size.height),
-        ))
-        .map_err(|error| format!("Failed to restore main window size: {error}"))?;
-    window_size_state.replace(restored_size)
+    let restored_size = if let Some(saved_size) = window_size_state.snapshot()? {
+        let size = fit_window_size_to_monitor(&window, saved_size, monitor.as_ref());
+        window_size_state.replace(size)?;
+        Some(size)
+    } else {
+        None
+    };
+
+    // Move before resizing so logical dimensions use the destination display's scale.
+    if let (Some(position), Some(monitor)) = (saved_position, monitor.as_ref()) {
+        let scale_factor = monitor.scale_factor();
+        let outer_size = window_outer_size_for_monitor(&window, monitor, restored_size);
+        let (fitted_position, target_position) = restore_window_position_for_monitor(
+            position,
+            outer_size,
+            monitor.work_area(),
+            scale_factor,
+        );
+        window
+            .set_position(target_position)
+            .map_err(|e| format!("Failed to restore main window position: {e}"))?;
+        window_size_state.replace_position(fitted_position)?;
+    }
+
+    if let Some(restored_size) = restored_size {
+        window
+            .set_size(LogicalSize::new(
+                f64::from(restored_size.width),
+                f64::from(restored_size.height),
+            ))
+            .map_err(|error| format!("Failed to restore main window size: {error}"))?;
+    }
+    // Resizing (and a DPI change) can alter the outer bounds; clamp the final rectangle.
+    if let (Some(position), Some(monitor)) = (saved_position, monitor.as_ref()) {
+        let scale_factor = monitor.scale_factor();
+        let outer_size = window_outer_size_for_monitor(&window, monitor, restored_size);
+        let (fitted_position, target_position) = restore_window_position_for_monitor(
+            position,
+            outer_size,
+            monitor.work_area(),
+            scale_factor,
+        );
+        window
+            .set_position(target_position)
+            .map_err(|e| format!("Failed to restore main window position: {e}"))?;
+        window_size_state.replace_position(fitted_position)?;
+    }
+    // Also remember the first launch's default position if the user later exits from the tray.
+    if let Ok(position) = window.outer_position() {
+        window_size_state.replace_position(position)?;
+    }
+    sync_main_webview_bounds(app)?;
+    Ok(())
 }
 
-pub(crate) fn persist_main_window_size(app: &tauri::AppHandle) -> Result<(), String> {
-    let window_size_state = app.state::<MainWindowSizeState>();
+pub(crate) fn persist_main_window_geometry(app: &tauri::AppHandle) -> Result<(), String> {
+    let window_size_state = app.state::<MainWindowState>();
+    let window = main_window(app);
+    let position = match window.as_ref() {
+        Some(window)
+            if !window.is_minimized().unwrap_or(true) && !window.is_maximized().unwrap_or(true) =>
+        {
+            window
+                .outer_position()
+                .ok()
+                .or(window_size_state.position()?)
+        }
+        _ => window_size_state.position()?,
+    };
     let saved_size = match window_size_state.snapshot()? {
         Some(size) => size,
         None => {
-            let window = app
-                .get_webview_window("main")
+            let window = main_window(app)
                 .ok_or_else(|| "Main window does not exist; cannot save window size".to_string())?;
             let physical_size = window
                 .inner_size()
@@ -1751,7 +2056,7 @@ pub(crate) fn persist_main_window_size(app: &tauri::AppHandle) -> Result<(), Str
     };
 
     app.state::<GuiConfigState>()
-        .set_window_size(saved_size)
+        .set_window_geometry(saved_size, position)
         .map(|_| ())
 }
 
@@ -1788,15 +2093,6 @@ pub(crate) fn sanitize_gui_config_at(
         changed = true;
     }
     let host = config.host.trim();
-    let host = if host.is_empty() {
-        if config.allow_lan {
-            "0.0.0.0"
-        } else {
-            "127.0.0.1"
-        }
-    } else {
-        host
-    };
     if config.host != host {
         config.host = host.to_string();
         changed = true;
@@ -1806,14 +2102,16 @@ pub(crate) fn sanitize_gui_config_at(
         config.allow_lan = allow_lan;
         changed = true;
     }
-    match migrate_auth_dir_at(config, install_dir, persistent_auth_dir) {
-        Ok(migrated) => changed |= migrated,
-        Err(error) => {
-            eprintln!("Failed to recover OAuth directory; keeping existing configuration: {error}");
+    if !config.auth_dir_user_selected {
+        match migrate_auth_dir_at(config, install_dir, persistent_auth_dir) {
+            Ok(migrated) => changed |= migrated,
+            Err(error) => {
+                eprintln!("Failed to recover OAuth directory; keeping existing configuration: {error}");
+            }
         }
     }
     if config.auth_dir.trim().is_empty()
-        || Path::new(config.auth_dir.trim()) == persistent_auth_dir
+        || (!config.auth_dir_user_selected && Path::new(config.auth_dir.trim()) == persistent_auth_dir)
     {
         config.auth_dir = DEFAULT_AUTH_DIR.to_string();
         changed = true;
@@ -1907,6 +2205,11 @@ pub(crate) fn sanitize_gui_config_at(
         config.window_height = normalized_height;
         changed = true;
     }
+    if config.window_x.is_some() != config.window_y.is_some() {
+        config.window_x = None;
+        config.window_y = None;
+        changed = true;
+    }
     Ok(changed)
 }
 
@@ -1928,6 +2231,16 @@ pub(crate) fn write_gui_config_to_path(
         .and_then(|content| content.parse::<Document>().ok())
         .unwrap_or_default();
     let root = document.as_table_mut();
+    if config.usage_statistics_disabled == Some(true) {
+        set_codex_table_item(root, "usage_statistics_disabled", value(true));
+    } else {
+        root.remove("usage_statistics_disabled");
+    }
+    if config.image_generation_user_selected {
+        set_codex_table_item(root, "image-generation-user-selected", value(true));
+    } else {
+        root.remove("image-generation-user-selected");
+    }
     for (key, item) in [
         ("locale", value(config.locale.as_str())),
         ("port", value(i64::from(config.port))),
@@ -1939,6 +2252,7 @@ pub(crate) fn write_gui_config_to_path(
         ("close-behavior", value(config.close_behavior.as_str())),
         ("default-terminal", value(config.default_terminal.as_str())),
         ("auth-dir", value(config.auth_dir.as_str())),
+        ("auth-dir-user-selected", value(config.auth_dir_user_selected)),
         (
             "management-secret-key",
             value(config.management_secret_key.as_str()),
@@ -2016,6 +2330,13 @@ pub(crate) fn write_gui_config_to_path(
             root.remove(key);
         }
     }
+    for (key, coordinate) in [("window-x", config.window_x), ("window-y", config.window_y)] {
+        if let Some(coordinate) = coordinate {
+            set_codex_table_item(root, key, value(i64::from(coordinate)));
+        } else {
+            root.remove(key);
+        }
+    }
     let mut api_keys = Array::new();
     for entry in &config.api_keys {
         let mut table = InlineTable::new();
@@ -2071,7 +2392,7 @@ pub(crate) fn validate_gui_config(config: &GuiConfigFile) -> Result<(), String> 
     if config.port == 0 {
         return Err("GUI configuration port must be between 1 and 65535".to_string());
     }
-    if config.host.trim().is_empty() || config.host.chars().any(char::is_control) {
+    if config.host.chars().any(char::is_control) {
         return Err("Invalid GUI configuration host".to_string());
     }
     if config.auth_dir.trim().is_empty() || config.auth_dir.chars().any(char::is_control) {
@@ -2109,7 +2430,11 @@ pub(crate) fn validate_gui_config(config: &GuiConfigFile) -> Result<(), String> 
         }
         validate_api_key_remark(&entry.remark)?;
     }
-    validate_strong_management_secret_key(&config.management_secret_key)?;
+    if config.management_secret_key.is_empty() {
+        validate_management_secret_key(&config.management_secret_key)?;
+    } else {
+        validate_strong_management_secret_key(&config.management_secret_key)?;
+    }
     validate_routing_strategy(config.routing_strategy.trim())?;
     if config.proxy_override {
         network_proxy::normalize_optional_proxy_url(&config.proxy_url)?;

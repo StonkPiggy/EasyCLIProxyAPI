@@ -12,6 +12,7 @@ import {
 const configuration = (): CodexModelConfiguration => ({
   display_name: 'Third Party',
   description: null,
+  base_instructions: 'You are a helpful coding assistant.',
   context_window: 128_000,
   max_context_window: 128_000,
   effective_context_window_percent: 95,
@@ -25,9 +26,27 @@ const configuration = (): CodexModelConfiguration => ({
   input_modalities: ['text', 'image'],
   visibility: 'list',
   supports_parallel_tool_calls: false,
+  supports_search_tool: false,
 });
 
 describe('Codex 模型列表编辑', () => {
+  test('仅修改 Tool Search 也能触发保存，并可恢复默认值', () => {
+    const original = configuration();
+    const edited = cloneCodexModelConfiguration(original);
+    edited.supports_search_tool = true;
+    expect(sameCodexModelConfiguration(original, edited)).toBeFalse();
+    expect(validateCodexModelConfiguration(edited)).toBeNull();
+    expect(original.supports_search_tool).toBeFalse();
+    expect(sameCodexModelConfiguration(original, cloneCodexModelConfiguration(original))).toBeTrue();
+  });
+  test('识别系统提示词修改并拒绝空提示词', () => {
+    const original = configuration();
+    const edited = { ...original, base_instructions: '请用中文回答。\n保留换行。' };
+    expect(sameCodexModelConfiguration(original, edited)).toBeFalse();
+    expect(validateCodexModelConfiguration(edited)).toBeNull();
+    expect(validateCodexModelConfiguration({ ...original, base_instructions: ' \n ' }))
+      .toBe('agents.catalog.invalidPrompt');
+  });
   test("区分 Codex 客户端 API、模板后备与自定义上下文", () => {
     const model: CodexCatalogEditorModel = {
       slug: "model-a", hasOfficialTemplate: true, customized: false,

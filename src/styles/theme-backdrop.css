@@ -1,0 +1,55 @@
+:root[data-theme-backdrop] #root {
+  background: var(--theme-backdrop-image) center / 100% 100% no-repeat var(--theme-backdrop-color);
+}
+
+:root[data-theme-backdrop='image'] #root {
+  background-size: cover;
+  background-position: var(--theme-backdrop-position, center);
+  background-repeat: no-repeat;
+}
+
+:root[data-theme-backdrop] :is(.immersive-window, .app-shell, .workspace),
+:root[data-theme-backdrop] .workspace .content {
+  background: transparent;
+}
+
+:root[data-theme-backdrop] .sidebar {
+  background: var(--theme-backdrop-sidebar);
+}
+
+:root[data-theme-backdrop='image'] :is(
+  .sidebar,
+  .panel,
+  .surface-panel,
+  .surface-card,
+  .tabs-control.secondary-page-tabs:not(.agent-subpage-tabs),
+  .home-overview-heading .home-overview-label,
+  .home-overview-heading .core-health-entry,
+  .oauth-browser-picker
+) {
+  -webkit-backdrop-filter: blur(12px) saturate(1.15);
+  backdrop-filter: blur(12px) saturate(1.15);
+}
+
+:root[data-theme-backdrop='image'] :is(
+  .tabs-control.secondary-page-tabs:not(.agent-subpage-tabs),
+  .home-overview-heading .home-overview-label,
+  .home-overview-heading .core-health-entry,
+  .oauth-browser-picker
+) {
+  padding-inline: 12px;
+  border-radius: var(--radius-lg);
+  background: var(--theme-backdrop-panel);
+}
+
+:root[data-theme-backdrop='image'] :is(
+  .home-overview-heading .home-overview-label,
+  .home-overview-heading .core-health-entry,
+  .oauth-browser-picker
+) {
+  padding-block: 4px;
+}
+
+:root[data-theme-backdrop] .immersive-window .window-titlebar {
+  background: var(--theme-backdrop-panel);
+}

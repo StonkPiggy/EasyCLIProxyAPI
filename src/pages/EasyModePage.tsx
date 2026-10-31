@@ -1,3 +1,7 @@
+import { Checkbox } from '../components/Checkbox';
+import { SegmentedControl } from '../components/SegmentedControl';
+import { getOAuthStatus, startOAuthLogin, openOAuthUrl } from '../services/oauth';
+import { ThemeSelector } from '../components/ThemeSelector';
 import {
   useCallback,
   useEffect,
@@ -6,18 +10,16 @@ import {
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
 } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import {
   ArrowLeft,
   ArrowRight,
+  Copy,
   Check,
   ChevronDown,
+  ExternalLink,
   Languages,
   LoaderCircle,
-  Monitor,
-  Moon,
   RefreshCw,
-  Sun,
   X,
 } from "lucide-react";
 import appLogo from "../assets/logo.jpg";
@@ -26,9 +28,12 @@ import type { MessageKey } from "../i18n/resources";
 import { MessageNotice, FloatingNotice, useAppNotice, type NoticeMessage } from "../appNotice";
 import {
   managementApi,
+  providerGroupsApi,
   readString,
   responseList,
 } from "../services/managementApi";
+import { appendNativeProviderGroup } from '../services/providerGroups';
+import { providerRowsFromGroups, type ProviderSection } from './ApiAccessPage';
 import {
   DEEPSEEK_BASE_URL,
   fetchModels,
@@ -39,23 +44,25 @@ import {
   type ModelProvider,
 } from "../services/modelService";
 import { normalizeProviderProxyUrl } from "../services/providerProxy";
+import { normalizeOAuthProvider } from "../services/authFiles";
 import { type ThemePreference } from "../theme";
 import { AgentsPage } from "./AgentsPage";
-
 import codexIcon from "../assets/icons/codex.svg";
 import claudeIcon from "../assets/icons/claude.svg";
 import antigravityIcon from "../assets/icons/antigravity.svg";
 import kimiIcon from "../assets/icons/kimi-light.svg";
 import grokIcon from "../assets/icons/grok.svg";
 import devinIcon from "../assets/icons/devin.svg";
+import metaIcon from "../assets/icons/meta.svg";
 import openaiIcon from "../assets/icons/openai-light.svg";
 import deepseekIcon from "../assets/icons/deepseek.svg";
 import geminiIcon from "../assets/icons/gemini.svg";
+import vertexIcon from '../assets/icons/vertex.svg';
 
 type AuthMethod = "oauth" | "api";
 type SetupStep = 1 | 2;
 
-type OAuthProviderId = "codex" | "claude" | "antigravity" | "kimi" | "xai" | "devin";
+type OAuthProviderId = "codex" | "claude" | "antigravity" | "kimi" | "xai" | "devin" | "meta";
 
 type OAuthProviderInfo = {
   id: OAuthProviderId;
@@ -71,15 +78,17 @@ const oauthProviders: OAuthProviderInfo[] = [
   { id: "kimi", name: "Kimi OAuth", icon: kimiIcon, descriptionKey: "easyMode.oauth.providerDesc.kimi" },
   { id: "xai", name: "xAI OAuth", icon: grokIcon, descriptionKey: "easyMode.oauth.providerDesc.xai" },
   { id: "devin", name: "Devin OAuth", icon: devinIcon, descriptionKey: "easyMode.oauth.providerDesc.devin" },
+  { id: "meta", name: "Muse (Meta) OAuth", icon: metaIcon, descriptionKey: "easyMode.oauth.providerDesc.meta" },
 ];
 
-type ApiSection = "openai-compatibility" | "deepseek" | "claude" | "gemini" | "codex";
-type ApiManagementSection = "openai-compatibility" | "claude-api-key" | "codex-api-key" | "gemini-api-key";
+type ApiSection = "openai-compatibility" | "deepseek" | "claude" | "gemini" | "codex" | 'interactions' | 'vertex' | 'xai' | 'meta';
+type ApiManagementSection = "openai-compatibility" | "claude-api-key" | "codex-api-key" | "gemini-api-key" | 'interactions-api-key' | 'vertex-api-key' | 'xai-api-key' | 'meta-api-key';
 
 type ApiSectionOption = {
   id: ApiSection;
   managementSection: ApiManagementSection;
   nameKey: MessageKey;
+  name?: string;
   provider: ModelProvider;
   defaultBaseUrl: string;
   icon: string;
@@ -91,13 +100,11 @@ const apiSectionOptions: ApiSectionOption[] = [
   { id: "codex", managementSection: "codex-api-key", nameKey: "easyMode.api.platformName.codex", provider: "codex", defaultBaseUrl: "", icon: codexIcon },
   { id: "gemini", managementSection: "gemini-api-key", nameKey: "easyMode.api.platformName.gemini", provider: "gemini", defaultBaseUrl: "", icon: geminiIcon },
   { id: "deepseek", managementSection: "codex-api-key", nameKey: "easyMode.api.platformName.deepseek", provider: "deepseek", defaultBaseUrl: DEEPSEEK_BASE_URL, icon: deepseekIcon },
+  { id: 'interactions', managementSection: 'interactions-api-key', nameKey: 'easyMode.api.platformName.gemini', name: 'Gemini Interactions', provider: 'interactions', defaultBaseUrl: 'https://generativelanguage.googleapis.com', icon: geminiIcon },
+  { id: 'vertex', managementSection: 'vertex-api-key', nameKey: 'easyMode.api.platformName.gemini', name: 'Vertex AI', provider: 'vertex', defaultBaseUrl: 'https://aiplatform.googleapis.com', icon: vertexIcon },
+  { id: 'xai', managementSection: 'xai-api-key', nameKey: 'easyMode.api.platformName.openai', name: 'xAI', provider: 'xai', defaultBaseUrl: 'https://api.x.ai/v1', icon: grokIcon },
+  { id: 'meta', managementSection: 'meta-api-key', nameKey: 'easyMode.api.platformName.openai', name: 'Meta', provider: 'meta', defaultBaseUrl: 'https://api.meta.ai/v1', icon: metaIcon },
 ];
-
-const isDeepSeekRecord = (record: Record<string, unknown>) => {
-  const name = readString(record, "name").trim().toLowerCase();
-  const baseUrl = readString(record, "base-url", "baseUrl").trim().toLowerCase();
-  return name.includes("deepseek") || /^https?:\/\/api\.deepseek\.com(?:\/|$)/i.test(baseUrl);
-};
 
 export function EasyModePage({
   onExit,
@@ -119,6 +126,7 @@ export function EasyModePage({
 
   const [authFiles, setAuthFiles] = useState<Record<string, unknown>[]>([]);
   const [apiCounts, setApiCounts] = useState<Record<ApiSection, number>>({
+    interactions: 0, vertex: 0, xai: 0, meta: 0,
     "openai-compatibility": 0,
     deepseek: 0,
     claude: 0,
@@ -127,6 +135,8 @@ export function EasyModePage({
   });
 
   const [oauthLoggingIn, setOauthLoggingIn] = useState<OAuthProviderId | null>(null);
+  const [oauthAuthorization, setOauthAuthorization] = useState<{ provider: OAuthProviderId; url: string } | null>(null);
+  const [oauthDeviceCode, setOauthDeviceCode] = useState<{ provider: OAuthProviderId; code: string } | null>(null);
   const oauthFeedback = useAppNotice();
   const { showNotice: showOAuthNotice, clearNotice: clearOAuthNotice } = oauthFeedback;
   const oauthPollTimer = useRef<number | null>(null);
@@ -167,6 +177,7 @@ export function EasyModePage({
   const guideTooltipRef = useRef<HTMLElement | null>(null);
   const [guideCardPosition, setGuideCardPosition] = useState<{ top: number; left: number } | null>(null);
   const [langMenuOpen, setLangMenuOpen] = useState(false);
+  const [themeMenuOpen, setThemeMenuOpen] = useState(false);
   const langMenuRef = useRef<HTMLDivElement>(null);
   const langButtonRef = useRef<HTMLButtonElement>(null);
 
@@ -190,11 +201,12 @@ export function EasyModePage({
 
   const refreshSourceStatus = useCallback(async () => {
     try {
-      const authFilesPayload = await managementApi.get("/auth-files");
+      const authFilesPayload = await managementApi.get("/credentials");
       const files = responseList(authFilesPayload, "files");
       setAuthFiles(files);
 
       const counts: Record<ApiSection, number> = {
+        interactions: 0, vertex: 0, xai: 0, meta: 0,
         "openai-compatibility": 0,
         deepseek: 0,
         claude: 0,
@@ -202,22 +214,19 @@ export function EasyModePage({
         codex: 0,
       };
 
-      const configPayload = await managementApi.get("/config");
-      const recordsBySection: Record<ApiManagementSection, Record<string, unknown>[]> = {
-        "openai-compatibility": responseList(configPayload, "openai-compatibility"),
-        "claude-api-key": responseList(configPayload, "claude-api-key"),
-        "codex-api-key": responseList(configPayload, "codex-api-key"),
-        "gemini-api-key": responseList(configPayload, "gemini-api-key"),
-      };
+      const sections = [...new Set(apiSectionOptions.map((option) => option.managementSection))];
+      const recordsBySection = Object.fromEntries(await Promise.all(sections.map(async (section) => [section, await providerGroupsApi.get(section)]))) as Record<ApiManagementSection, Record<string, unknown>[]>;
 
-      for (const section of apiSectionOptions) {
-        const sourceList = recordsBySection[section.managementSection];
-        const list = section.id === "deepseek"
-          ? sourceList.filter(isDeepSeekRecord)
-          : section.id === "codex"
-            ? sourceList.filter((record) => !isDeepSeekRecord(record))
-            : sourceList;
-        counts[section.id] = list.length;
+      for (const option of apiSectionOptions) {
+        const rows = providerRowsFromGroups(
+          option.managementSection as ProviderSection,
+          recordsBySection[option.managementSection],
+        );
+        counts[option.id] = new Set(rows.filter((row) => (
+          option.id === 'deepseek' ? row.category === 'deepseek'
+            : option.id === 'codex' ? row.category !== 'deepseek'
+              : true
+        )).map((row) => row.source?.groupIndex)).size;
       }
       setApiCounts(counts);
     } catch (e) {
@@ -234,9 +243,10 @@ export function EasyModePage({
   }, [refreshSourceStatus]);
 
   const isOAuthLoggedIn = (providerId: OAuthProviderId) => {
-    const norm = providerId === "claude" ? "claude" : providerId === "codex" ? "codex" : providerId;
+    const norm = providerId;
     return authFiles.some((f) => {
       const p = readString(f, "provider", "type").toLowerCase();
+      if (norm === "meta") return normalizeOAuthProvider(p) === "meta";
       return (norm === "devin" && p === "cognition") || p.includes(norm) || (norm === "codex" && p.includes("openai")) || (norm === "claude" && p.includes("anthropic"));
     });
   };
@@ -264,21 +274,20 @@ export function EasyModePage({
     const generation = ++oauthGeneration.current;
     if (oauthPollTimer.current !== null) window.clearTimeout(oauthPollTimer.current);
     oauthPollTimer.current = null;
+    setOauthAuthorization(null);
+    setOauthDeviceCode(null);
     setOauthLoggingIn(provider);
     clearOAuthNotice();
 
     try {
-      const result = await invoke<{
-        url?: string;
-        state?: string;
-        opened?: boolean;
-        openError?: string;
-      }>("start_oauth_login", {
+      const result = await startOAuthLogin({
         provider,
         browser: "default",
       });
 
       if (generation !== oauthGeneration.current) return;
+
+      if (result.url) setOauthAuthorization({ provider, url: result.url });
 
       if (!result.state) {
         showOAuthNotice({ key: "easyMode.notice.oauthStateFailed" }, "error");
@@ -286,31 +295,46 @@ export function EasyModePage({
         return;
       }
 
+      if (result.userCode?.trim()) {
+        setOauthDeviceCode({ provider, code: result.userCode.trim() });
+      }
+
+      if (!result.opened) {
+        showOAuthNotice(result.openError
+          ? { key: "oauth.openFailedDetail", variables: { error: result.openError } }
+          : { key: "oauth.openFailed" }, "info");
+      }
+
       const stateKey = result.state;
-      const deadline = Date.now() + 10 * 60_000;
+      const expirySeconds = result.expiresIn;
+      const deadline = Date.now() + (typeof expirySeconds === "number" && Number.isFinite(expirySeconds) && expirySeconds > 0
+        ? expirySeconds * 1000 : 10 * 60_000);
       let failures = 0;
       const poll = async () => {
         if (generation !== oauthGeneration.current) return;
         if (Date.now() >= deadline) {
           setOauthLoggingIn(null);
+          setOauthAuthorization(null);
+          setOauthDeviceCode((current) => current?.provider === provider ? null : current);
           showOAuthNotice({ key: "easyMode.notice.oauthTimeout" }, "error");
           return;
         }
         try {
-          const pollRes = await invoke<{ status: string; error?: string }>(
-            "get_oauth_status",
-            { state: stateKey },
-          );
+          const pollRes = await getOAuthStatus({ state: stateKey });
           if (generation !== oauthGeneration.current) return;
           failures = 0;
           const status = (pollRes.status || "").toLowerCase();
           if (status === "ok") {
             setOauthLoggingIn(null);
+            setOauthAuthorization(null);
+            setOauthDeviceCode((current) => current?.provider === provider ? null : current);
             showOAuthNotice({ key: "easyMode.notice.oauthSuccess" }, "success");
             setGuideOAuthCompleted(true);
             void refreshSourceStatus();
           } else if (status === "error") {
             setOauthLoggingIn(null);
+            setOauthAuthorization(null);
+            setOauthDeviceCode((current) => current?.provider === provider ? null : current);
             showOAuthNotice(pollRes.error
               ? { key: "easyMode.notice.oauthFailedWithReason", variables: { error: pollRes.error } }
               : { key: "easyMode.notice.oauthFailed" }, "error");
@@ -321,6 +345,8 @@ export function EasyModePage({
           failures += 1;
           if (failures >= 3) {
             setOauthLoggingIn(null);
+            setOauthAuthorization(null);
+            setOauthDeviceCode((current) => current?.provider === provider ? null : current);
             showOAuthNotice(String(error), "error");
             return;
           }
@@ -333,7 +359,34 @@ export function EasyModePage({
     } catch (err) {
       if (generation !== oauthGeneration.current) return;
       setOauthLoggingIn(null);
+      setOauthDeviceCode((current) => current?.provider === provider ? null : current);
       showOAuthNotice(String(err), "error");
+    }
+  };
+
+  const copyDeviceCode = async (code: string) => {
+    try {
+      await navigator.clipboard.writeText(code);
+      showOAuthNotice({ key: "oauth.deviceCodeCopied" }, "success");
+    } catch {
+      showOAuthNotice({ key: "oauth.deviceCodeCopyFailed" }, "error");
+    }
+  };
+
+  const copyAuthorizationUrl = async (url: string) => {
+    try {
+      await navigator.clipboard.writeText(url);
+      showOAuthNotice({ key: "oauth.linkCopied" }, "success");
+    } catch {
+      showOAuthNotice({ key: "oauth.linkCopyFailed" }, "error");
+    }
+  };
+
+  const openAuthorizationUrl = async (url: string) => {
+    try {
+      await openOAuthUrl({ url, browser: "default" });
+    } catch (error) {
+      showOAuthNotice(String(error), "error");
     }
   };
 
@@ -447,28 +500,16 @@ export function EasyModePage({
     try {
       const selectedOption = apiSectionOptions.find((option) => option.id === selectedApiSection);
       const managementSection = selectedOption?.managementSection ?? "openai-compatibility";
-      const configPayload = await managementApi.get("/config");
-      const list = responseList(configPayload, managementSection);
+      const list = await providerGroupsApi.get(managementSection);
       const selectedModels = apiSelectedModels.map((model) => ({ name: model.name.trim() }));
       const models = selectedModels;
-      const newEntry = managementSection === "openai-compatibility"
-        ? {
-          name: apiRemark.trim() || `${selectedApiSection} (${list.length + 1})`,
-          "base-url": normalizeBaseUrl(apiBaseUrl.trim()),
-          "api-key-entries": [
-            { "api-key": apiKey.trim(), ...(proxyUrl ? { "proxy-url": proxyUrl } : {}) },
-          ],
-          models,
-        }
-        : {
-          ...(selectedApiSection === "deepseek" ? { name: "DeepSeek" } : {}),
-          "api-key": apiKey.trim(),
-          ...(proxyUrl ? { "proxy-url": proxyUrl } : {}),
-          "base-url": normalizeBaseUrl(apiBaseUrl.trim()),
-          models,
-        };
-
-      await managementApi.put(`/${managementSection}`, [...list, newEntry]);
+      const newEntry = {
+        name: apiRemark.trim() || (selectedApiSection === 'deepseek' ? 'DeepSeek' : selectedApiSection),
+        'base-url': normalizeBaseUrl(apiBaseUrl.trim()),
+        keys: [{ 'api-key': apiKey.trim(), ...(proxyUrl ? { 'proxy-url': proxyUrl } : {}) }],
+        models,
+      };
+      await providerGroupsApi.put(managementSection, appendNativeProviderGroup(list, newEntry));
       showApiNotice({ key: "easyMode.notice.apiSaveSuccess" });
       setGuideApiSaved(true);
       void refreshSourceStatus();
@@ -674,7 +715,7 @@ export function EasyModePage({
           </div>
           <button
             type="button"
-            className={`simple-mode-guide-toggle simple-mode-highlight-button${guideActive ? " active" : ""}`}
+            className="primary-button compact-button simple-mode-guide-toggle"
             title={guideActive ? t("easyMode.guide.toggleClose") : t("easyMode.guide.toggleOpen")}
             onClick={() => {
               handleGuideToggle();
@@ -686,38 +727,8 @@ export function EasyModePage({
 
         <div className="simple-mode-topbar-right">
           {setTheme ? (
-            <div className="simple-mode-theme-group" role="group" aria-label={t("app.theme.label")}>
-              <button
-                type="button"
-                className={theme === "light" ? "active" : ""}
-                title={t("easyMode.theme.light")}
-                aria-label={t("easyMode.theme.light")}
-                aria-pressed={theme === "light"}
-                onClick={() => setTheme("light")}
-              >
-                <Sun size={15} />
-              </button>
-              <button
-                type="button"
-                className={theme === "dark" ? "active" : ""}
-                title={t("easyMode.theme.dark")}
-                aria-label={t("easyMode.theme.dark")}
-                aria-pressed={theme === "dark"}
-                onClick={() => setTheme("dark")}
-              >
-                <Moon size={15} />
-              </button>
-              <button
-                type="button"
-                className={theme === "system" ? "active" : ""}
-                title={t("app.theme.switchToSystem")}
-                aria-label={t("app.theme.system")}
-                aria-pressed={theme === "system"}
-                onClick={() => setTheme("system")}
-              >
-                <Monitor size={15} />
-              </button>
-            </div>
+            <ThemeSelector value={theme ?? 'light'} onChange={setTheme} open={themeMenuOpen}
+              onOpenChange={(open) => { setThemeMenuOpen(open); if (open) setLangMenuOpen(false); }} />
           ) : null}
 
           <div ref={langMenuRef} className="simple-mode-lang-dropdown">
@@ -725,7 +736,7 @@ export function EasyModePage({
               ref={langButtonRef}
               type="button"
               className="simple-mode-lang-btn"
-              onClick={() => setLangMenuOpen(!langMenuOpen)}
+              onClick={() => { setThemeMenuOpen(false); setLangMenuOpen(!langMenuOpen); }}
               title={t("easyMode.language.switch")}
               aria-label={t("easyMode.language.switch")}
               aria-haspopup="listbox"
@@ -734,6 +745,7 @@ export function EasyModePage({
               onKeyDown={(event) => {
                 if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
                 event.preventDefault();
+                setThemeMenuOpen(false);
                 setLangMenuOpen(true);
                 window.requestAnimationFrame(() => {
                   const options = langMenuRef.current?.querySelectorAll<HTMLButtonElement>('[role="option"]');
@@ -746,7 +758,7 @@ export function EasyModePage({
               <ChevronDown size={13} />
             </button>
             {langMenuOpen ? (
-              <div id="simple-mode-language-list" className="simple-mode-lang-menu" role="listbox" aria-label={t("easyMode.language.switch")} onKeyDown={handleLanguageListKeyDown}>
+              <div id="simple-mode-language-list" className="simple-mode-lang-menu" data-theme-surface="overlay" role="listbox" aria-label={t("easyMode.language.switch")} onKeyDown={handleLanguageListKeyDown}>
                 {languageOptions.map((opt) => (
                   <button
                     key={opt.value}
@@ -771,7 +783,7 @@ export function EasyModePage({
 
           <button
             type="button"
-            className="secondary-button simple-mode-exit-btn"
+            className="secondary-button compact-button simple-mode-exit-btn"
             title={t("easyMode.exitTitle")}
             onClick={() => onExit?.()}
           >
@@ -844,11 +856,11 @@ export function EasyModePage({
                 <div className="simple-mode-choice-title">
                   <strong>{t("easyMode.oauth.title")}</strong>
                   {totalLoggedInOAuth > 0 ? (
-                    <span className="state-pill success" style={{ fontSize: "12px" }}>
-                      {t("easyMode.oauth.accountsLoggedIn", { count: totalLoggedInOAuth })}
+                    <span className="state-pill success">
+                      {t(totalLoggedInOAuth === 1 ? "easyMode.oauth.accountsLoggedInOne" : "easyMode.oauth.accountsLoggedIn", { count: totalLoggedInOAuth })}
                     </span>
                   ) : (
-                    <span className="state-pill neutral" style={{ fontSize: "12px" }}>{t("easyMode.oauth.recommended")}</span>
+                    <span className="state-pill neutral">{t("easyMode.oauth.recommended")}</span>
                   )}
                 </div>
               </div>
@@ -867,8 +879,8 @@ export function EasyModePage({
                 <div className="simple-mode-choice-title">
                   <strong>{t("easyMode.api.title")}</strong>
                   {totalApiProviders > 0 ? (
-                    <span className="state-pill success" style={{ fontSize: "12px" }}>
-                      {t("easyMode.api.platformsConnected", { count: totalApiProviders })}
+                    <span className="state-pill success">
+                      {t(totalApiProviders === 1 ? "easyMode.api.platformsConnectedOne" : "easyMode.api.platformsConnected", { count: totalApiProviders })}
                     </span>
                   ) : null}
                 </div>
@@ -904,19 +916,51 @@ export function EasyModePage({
                         </div>
                       </div>
 
+                      {oauthAuthorization?.provider === provider.id ? (
+                        <div className="simple-mode-oauth-authorization">
+                          {provider.id === "meta" ? <p className="oauth-hint">{t("oauth.metaHint")}</p> : null}
+                          <div className="oauth-auth-url-box surface-sunken">
+                            <div className="oauth-auth-url-label">{t("oauth.authorizationLink")}</div>
+                            <div className="oauth-auth-url-value" title={oauthAuthorization.url}>{oauthAuthorization.url}</div>
+                            <div className="oauth-auth-url-actions">
+                              <button type="button" className="secondary-button compact-button" onClick={() => void copyAuthorizationUrl(oauthAuthorization.url)}>
+                                <Copy size={14} aria-hidden="true" />{t("oauth.copyLink")}
+                              </button>
+                              <button type="button" className="secondary-button compact-button" onClick={() => void openAuthorizationUrl(oauthAuthorization.url)}>
+                                <ExternalLink size={14} aria-hidden="true" />{t("oauth.openLink")}
+                              </button>
+                            </div>
+                          </div>
+                          {oauthDeviceCode?.provider === provider.id ? (
+                            <div className="simple-mode-device-code">
+                              <div className="simple-mode-device-code-label">{t("oauth.deviceCodeLabel")}</div>
+                              <code>{oauthDeviceCode.code}</code>
+                              <button
+                                type="button"
+                                className="secondary-button compact-button"
+                                onClick={() => void copyDeviceCode(oauthDeviceCode.code)}
+                              >
+                                <Copy size={14} aria-hidden="true" />
+                                {t("oauth.copyDeviceCode")}
+                              </button>
+                            </div>
+                          ) : null}
+                        </div>
+                      ) : null}
+
                       <div className="simple-mode-provider-card-foot">
                         {loggedIn ? (
-                          <span className="state-pill success" style={{ fontSize: "12px" }}>
+                          <span className="state-pill success">
                             <Check size={12} style={{ marginRight: 4 }} />
                             {t("easyMode.oauth.loggedIn")}
                           </span>
                         ) : (
-                          <span className="state-pill neutral" style={{ fontSize: "12px" }}>{t("easyMode.status.notLoggedIn")}</span>
+                          <span className="state-pill neutral">{t("easyMode.status.notLoggedIn")}</span>
                         )}
 
                         <button
                           type="button"
-                          className={loggedIn ? "secondary-button" : "primary-button"}
+                          className={`${loggedIn ? "secondary-button" : "primary-button"} small-button`}
                           disabled={isLogging}
                           onClick={() => void handleStartOAuth(provider.id)}
                         >
@@ -950,19 +994,20 @@ export function EasyModePage({
               ) : null}
 
               <div className="simple-mode-api-form">
-                <div className="simple-mode-api-platforms">
-                  {apiSectionOptions.map((opt) => (
-                    <button
-                      type="button"
-                      key={opt.id}
-                      className={`secondary-button simple-mode-api-platform${selectedApiSection === opt.id ? " active" : ""}`}
-                      onClick={() => handleApiSectionChange(opt.id)}
-                    >
+                <SegmentedControl
+                  className="simple-mode-api-platforms"
+                  aria-label={t("easyMode.api.platform")}
+                  value={selectedApiSection}
+                  onChange={handleApiSectionChange}
+                  buttonClassName="secondary-button simple-mode-api-platform"
+                  items={apiSectionOptions.map((opt) => ({
+                    value: opt.id,
+                    label: <>
                       <img className="simple-mode-api-platform-icon" src={opt.icon} alt="" />
-                      {t(opt.nameKey)}
-                    </button>
-                  ))}
-                </div>
+                      {opt.name ?? t(opt.nameKey)}
+                    </>,
+                  }))}
+                />
 
                 <div className="simple-mode-field">
                   <label>{t("easyMode.api.name")}</label>
@@ -1024,7 +1069,7 @@ export function EasyModePage({
                     <div className="simple-mode-api-model-fetch">
                       <button
                         type="button"
-                        className="secondary-button simple-mode-api-fetch-button"
+                        className="secondary-button compact-button simple-mode-api-fetch-button"
                         disabled={apiTesting || !apiBaseUrl.trim() || !apiKey.trim()}
                         onClick={() => void handleTestApi()}
                       >
@@ -1072,12 +1117,7 @@ export function EasyModePage({
                                 className={`simple-mode-api-model-option${selected ? " selected" : ""}`}
                                 key={model.name}
                               >
-                                <input
-                                  type="checkbox"
-                                  checked={selected}
-                                  disabled={apiTesting}
-                                  onChange={() => handleToggleApiModel(model)}
-                                />
+                                <Checkbox checked={selected} disabled={apiTesting} onChange={() => handleToggleApiModel(model)} />
                                 <span title={model.name}>{model.name}</span>
                               </label>
                             );
@@ -1126,7 +1166,7 @@ export function EasyModePage({
             <button
               type="button"
               className="primary-button"
-              style={{ minHeight: 42, padding: "0 22px", fontSize: "15px" }}
+              style={{ minHeight: 42, padding: "0 22px" }}
               disabled={!hasConnectedSource}
               onClick={() => {
                 setActiveStep(2);
@@ -1168,6 +1208,7 @@ export function EasyModePage({
         <aside
           ref={guideTooltipRef}
           className="guide-interactive-card"
+          data-theme-surface="overlay"
           style={{
             top: guideCardPosition ? `${guideCardPosition.top}px` : "0px",
             left: guideCardPosition ? `${guideCardPosition.left}px` : "0px",
@@ -1186,7 +1227,7 @@ export function EasyModePage({
 
             <button
               type="button"
-              className="guide-tooltip-close"
+              className="icon-button quiet ghost tiny-button"
               title={t("easyMode.guide.close")}
               onClick={() => setGuideActive(false)}
             >
@@ -1243,7 +1284,7 @@ export function EasyModePage({
                   ) : apiSelectedModels.length === 0 ? (
                     t("easyMode.guide.cardStep2ApiSelectTip")
                   ) : (
-                    <span>{t("easyMode.guide.cardStep2ApiSelectedTip", { count: apiSelectedModels.length })}</span>
+                    <span>{t(apiSelectedModels.length === 1 ? "easyMode.guide.cardStep2ApiSelectedTipOne" : "easyMode.guide.cardStep2ApiSelectedTip", { count: apiSelectedModels.length })}</span>
                   )}
                 </div>
               </>
@@ -1291,7 +1332,7 @@ export function EasyModePage({
               {guideStep > 1 ? (
                 <button
                   type="button"
-                  className="secondary-button guide-btn-sm"
+                  className="secondary-button small-button guide-btn-sm"
                   onClick={handlePrevGuideStep}
                 >
                   {t("easyMode.navigation.back")}
@@ -1300,7 +1341,7 @@ export function EasyModePage({
 
               <button
                 type="button"
-                className="primary-button guide-btn-sm"
+                className="primary-button small-button guide-btn-sm"
                 onClick={handleNextGuideStep}
                 disabled={!guideCanAdvance}
               >

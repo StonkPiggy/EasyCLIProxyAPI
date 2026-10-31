@@ -1,9 +1,35 @@
-import { FormEvent, useEffect, useRef, useState, type KeyboardEvent } from 'react';
-import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
-import { open } from '@tauri-apps/plugin-dialog';
+import { Notice } from '../components/Notice';
+import { EmptyState } from '../components/EmptyState';
+import { Switch } from '../components/Switch';
+import { onConfigFilesChanged } from '../services/events';
+import { restartCoreProcess } from '../services/coreLifecycle';
+import { openExternalUrl } from '../services/appSettings';
+import {
+  getCoreConfigSettings,
+  getSoftwareSettings,
+  getCoreTlsSettings,
+  setCoreManagementSecretKey,
+  clearCoreManagementSecretKey,
+  updateCoreApiKey,
+  addCoreApiKey,
+  saveCoreLoggingSettings as saveCoreLoggingSettingsCommand,
+  openCoreLogsDirectory,
+  deleteCoreApiKey,
+  saveCoreTlsSettings,
+  setCoreRoutingStrategy,
+  saveNetworkEndpointSettings as saveNetworkEndpointSettingsCommand,
+  saveRetrySettings as saveRetrySettingsCommand,
+  saveSessionRoutingSettings as saveSessionRoutingSettingsCommand,
+  saveSoftwareSettings as saveSoftwareSettingsCommand,
+} from '../services/coreSettings';
+import type { CoreConfigSettings, CoreApiKey, SoftwareSettings, CloseBehavior, CoreTlsSettings } from '../services/coreSettings';
+import { CoolingToggle } from '../components/settings/CoolingToggle';
+import { FormEvent, useEffect, useRef, useState } from 'react';
+import { open } from '../services/platform';
 import {
   AlertCircle,
+  Search,
+  ChevronRight,
   Bug,
   Check,
   Copy,
@@ -30,43 +56,24 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import { useCoreRuntime, type CoreStatus } from '../coreRuntime';
+import { useCoreRuntime } from '../coreRuntime';
 import { useI18n } from '../i18n';
 import { MessageNotice, FloatingNotice, useAppNotice } from '../appNotice';
 import { webUiManagementUrl } from '../services/clientAccess';
 import { ThinkingAliasesPage } from './ThinkingAliasesPage';
 import { SensitiveWordsPage } from './SensitiveWordsPage';
-import { handleHorizontalTabKey } from '../components/tabKeyboardNavigation';
-import { useDialogFocusTrap } from '../components/useDialogFocusTrap';
-
-type CoreConfigSettings = {
-  apiKeys: CoreApiKey[];
-  debug: boolean;
-  commercialMode: boolean;
-  loggingToFile: boolean;
-  logsMaxTotalSizeMb: number;
-  errorLogsMaxFiles: number;
-  usageStatisticsEnabled: boolean;
-  redisUsageQueueRetentionSeconds: number;
-  host: string;
-  port: number;
-  allowLan: boolean;
-  routingStrategy: string;
-  proxyUrl: string;
-  proxyOverride: boolean;
-  routingSessionAffinity: boolean;
-  routingSessionAffinityTtl: string;
-  disableCooling: boolean;
-  requestRetry: number;
-  maxRetryCredentials: number;
-  maxRetryInterval: number;
-  streamingBootstrapRetries: number;
-};
-
-type CoreApiKey = {
-  apiKey: string;
-  remark: string;
-};
+import { Tabs } from '../components/Tabs';
+import { SegmentedControl } from '../components/SegmentedControl';
+import { Dialog } from '../components/Dialog';
+import { useConfirmation } from '../components/ConfirmationDialog';
+import { TemplateConfigSection } from '../components/TemplateConfigSection';
+import { SettingsHelp } from '../components/SettingsHelp';
+import { templateMessages, templateText } from '../i18n/templateConfig';
+import {
+  settingsCategories, settingsTemplateGroups,
+  allSettingsTemplateGroups, settingsMessages, takeRequestedSettingField, type SettingsCategory,
+} from '../services/settingsNavigation';
+import { Select } from '../components/Select';
 
 type ConfigAction =
   | 'add-key'
@@ -81,9 +88,10 @@ type ConfigAction =
   | 'tls'
   | 'software'
   | null;
-type ConfigSubpage = 'general' | 'network' | 'routing' | 'software' | 'aliases' | 'sensitive-words';
-const CONFIG_SUBPAGES: readonly ConfigSubpage[] = ['general', 'network', 'routing', 'aliases', 'software', 'sensitive-words'];
-type CloseBehavior = 'ask' | 'exit' | 'minimize-to-tray';
+type ConfigSubpage = SettingsCategory;
+type SettingDestination = { category: ConfigSubpage; target: string; field?: string };
+type SettingSearchEntry = SettingDestination & { title: string; context: string; keywords: string };
+
 type NetworkDraftField =
   | 'port'
   | 'host'
@@ -99,26 +107,6 @@ type NetworkDraftField =
 type DraftRefreshMode = 'replace' | 'preserve';
 
 type NetworkDraftDirty = Record<NetworkDraftField, boolean>;
-
-type AgentTerminalOption = {
-  id: string;
-  label: string;
-};
-
-type SoftwareSettings = {
-  closeBehavior: CloseBehavior;
-  autostartEnabled: boolean;
-  startCoreOnLaunch: boolean;
-  silentStartEnabled: boolean;
-  defaultTerminal: string;
-  availableTerminals: AgentTerminalOption[];
-};
-
-type CoreTlsSettings = {
-  enabled: boolean;
-  cert: string;
-  key: string;
-};
 
 const cleanNetworkDraft = (): NetworkDraftDirty => ({
   port: false,
@@ -136,11 +124,13 @@ const cleanNetworkDraft = (): NetworkDraftDirty => ({
 
 const ROUTING_OPTIONS = [
   { value: 'round-robin', labelKey: 'config.routing.roundRobin' },
+  { value: 'weighted-round-robin', labelKey: 'config.routing.roundRobin' },
   { value: 'fill-first', labelKey: 'config.routing.fillFirst' },
 ] as const;
 
 export function ConfigPanelPage() {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
+  const { askConfirmation, confirmationDialog } = useConfirmation();
   const { status: coreStatus, publishStatus, refreshStatus } = useCoreRuntime();
   const [settings, setSettings] = useState<CoreConfigSettings | null>(null);
   const [softwareSettings, setSoftwareSettings] = useState<SoftwareSettings | null>(null);
@@ -194,14 +184,57 @@ export function ConfigPanelPage() {
     <FloatingNotice key={feedback.revision} notice={feedback.notice} onDismiss={feedback.clearNotice} />
   );
   const [activeSubpage, setActiveSubpage] = useState<ConfigSubpage>('general');
+  const [settingsSearch, setSettingsSearch] = useState('');
+  const [dirtyTemplateGroups, setDirtyTemplateGroups] = useState<readonly string[]>([]);
+  const [sensitiveWordsDirty, setSensitiveWordsDirty] = useState(false);
   const [sensitiveWordsVisited, setSensitiveWordsVisited] = useState(false);
+  const [aliasesVisited, setAliasesVisited] = useState(false);
+  const [pendingDestination, setPendingDestination] = useState<SettingDestination | null>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+  const categoryNavigationRef = useRef<HTMLDivElement>(null);
+  const st = (key: keyof typeof settingsMessages) => templateText(settingsMessages[key], locale);
+  const searching = settingsSearch.trim().length > 0;
+
+  useEffect(() => {
+    const navigation = categoryNavigationRef.current;
+    const tab = document.getElementById(`config-subpage-tab-${activeSubpage}`);
+    if (!navigation || !tab) return;
+    const revealSelectedTab = () => {
+      const bounds = navigation.getBoundingClientRect();
+      const tabBounds = tab.getBoundingClientRect();
+      if (tabBounds.left < bounds.left) navigation.scrollLeft += tabBounds.left - bounds.left;
+      else if (tabBounds.right > bounds.right) navigation.scrollLeft += tabBounds.right - bounds.right;
+    };
+    revealSelectedTab();
+    const observer = new ResizeObserver(revealSelectedTab);
+    observer.observe(navigation);
+    return () => observer.disconnect();
+  }, [activeSubpage]);
+
+  useEffect(() => {
+    if (!pendingDestination) return;
+    const frame = window.requestAnimationFrame(() => {
+      const target = document.getElementById(pendingDestination.field ?? pendingDestination.target)
+        ?? document.getElementById(pendingDestination.target);
+      if (target) {
+        const details = target.closest<HTMLDetailsElement>('.template-config-custom') ?? target.querySelector<HTMLDetailsElement>('.template-config-custom');
+        if (details) details.open = true;
+        target.scrollIntoView({ block: 'center', behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
+        const control = target.querySelector<HTMLElement>('input:not(:disabled), select:not(:disabled), textarea:not(:disabled)')
+          ?? target.querySelector<HTMLElement>('.template-config-custom > summary');
+        (control ?? target).focus({ preventScroll: true });
+      }
+      setPendingDestination(null);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [pendingDestination]);
   const [portDraft, setPortDraft] = useState('8317');
   const [hostDraft, setHostDraft] = useState('127.0.0.1');
   const [proxyUrlDraft, setProxyUrlDraft] = useState('');
   const [proxyOverrideDraft, setProxyOverrideDraft] = useState(false);
   const [sessionAffinityDraft, setSessionAffinityDraft] = useState(false);
   const [sessionTtlDraft, setSessionTtlDraft] = useState('');
-  const [disableCoolingDraft, setDisableCoolingDraft] = useState(false);
+  const [disableCoolingDraft, setDisableCoolingDraft] = useState(true);
   const [requestRetryDraft, setRequestRetryDraft] = useState('3');
   const [maxRetryCredentialsDraft, setMaxRetryCredentialsDraft] = useState('0');
   const [maxRetryIntervalDraft, setMaxRetryIntervalDraft] = useState('30');
@@ -211,6 +244,7 @@ export function ConfigPanelPage() {
   const [retryError, setRetryError] = useState('');
   const networkDraftDirtyRef = useRef<NetworkDraftDirty>(cleanNetworkDraft());
   const loggingDraftDirtyRef = useRef(false);
+  const otherDraftDirtyRef = useRef({ software: false, tls: false });
   const copyTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
@@ -219,11 +253,11 @@ export function ConfigPanelPage() {
     void loadSettings();
     void loadSoftwareSettings();
     void loadTlsSettings();
-    void listen('config-files-changed', () => {
+    void onConfigFilesChanged(() => {
       if (!disposed) {
         void loadSettings('preserve');
-        void loadSoftwareSettings();
-        void loadTlsSettings();
+        void loadSoftwareSettings('preserve');
+        void loadTlsSettings('preserve');
       }
     }).then((unlisten) => {
       if (disposed) unlisten();
@@ -306,10 +340,10 @@ export function ConfigPanelPage() {
   };
 
   async function loadSettings(mode: DraftRefreshMode = 'replace') {
-    setLoading(true);
+    if (mode === 'replace') setLoading(true);
     setLoadError('');
     try {
-      const result = await invoke<CoreConfigSettings>('get_core_config_settings');
+      const result = await getCoreConfigSettings();
       applySettings(result, mode);
     } catch (error) {
       setSettings(null);
@@ -319,11 +353,14 @@ export function ConfigPanelPage() {
     }
   }
 
-  async function loadSoftwareSettings() {
-    setSoftwareSettingsLoading(true);
-    setSoftwareSavedStatusVisible(false);
+  async function loadSoftwareSettings(mode: DraftRefreshMode = 'replace') {
+    if (mode === 'replace') {
+      setSoftwareSettingsLoading(true);
+      setSoftwareSavedStatusVisible(false);
+    }
     try {
-      const result = await invoke<SoftwareSettings>('get_software_settings');
+      const result = await getSoftwareSettings();
+      if (mode === 'preserve' && otherDraftDirtyRef.current.software) return;
       setSoftwareSettings(result);
       setSoftwareCloseBehaviorDraft(result.closeBehavior);
       setSoftwareAutostartDraft(result.autostartEnabled);
@@ -338,10 +375,11 @@ export function ConfigPanelPage() {
     }
   }
 
-  async function loadTlsSettings() {
-    setTlsSettingsLoading(true);
+  async function loadTlsSettings(mode: DraftRefreshMode = 'replace') {
+    if (mode === 'replace') setTlsSettingsLoading(true);
     try {
-      const result = await invoke<CoreTlsSettings>('get_core_tls_settings');
+      const result = await getCoreTlsSettings();
+      if (mode === 'preserve' && otherDraftDirtyRef.current.tls) return;
       setTlsSettings(result);
       setTlsEnabledDraft(result.enabled);
       setTlsCertDraft(result.cert);
@@ -357,8 +395,7 @@ export function ConfigPanelPage() {
 
   const runMutation = async (
     action: Exclude<ConfigAction, null>,
-    command: string,
-    args: Record<string, unknown>,
+    mutation: () => Promise<CoreConfigSettings>,
     successMessage: string,
   ) => {
     setBusyAction(action);
@@ -367,7 +404,7 @@ export function ConfigPanelPage() {
       : action === 'routing' ? routingFeedback : keyFeedback;
     mutationFeedback.clearNotice();
     try {
-      const result = await invoke<CoreConfigSettings>(command, args);
+      const result = await mutation();
       setSettings(result);
       setLoadError('');
       if (action !== 'routing') mutationFeedback.showNotice(successMessage, 'success');
@@ -438,10 +475,6 @@ export function ConfigPanelPage() {
       setManagementSecretError(t('config.webuiKey.error.empty'));
       return;
     }
-    if (secretKey === '123456') {
-      setManagementSecretError(t('config.webuiKey.error.legacyDefault'));
-      return;
-    }
     if (secretKey.length > 512) {
       setManagementSecretError(t('config.webuiKey.error.tooLong'));
       return;
@@ -457,8 +490,7 @@ export function ConfigPanelPage() {
 
     const saved = await runMutation(
       'management-secret',
-      'set_core_management_secret_key',
-      { secretKey },
+      () => setCoreManagementSecretKey({ secretKey }),
       t('config.webuiKey.notice.updated'),
     );
     if (saved) {
@@ -467,6 +499,18 @@ export function ConfigPanelPage() {
       setShowManagementSecret(false);
       setManagementSecretError('');
     }
+  };
+
+  const disableManagement = async () => {
+    const confirmed = await askConfirmation({
+      title: templateText(templateMessages.disableManagement, locale),
+      message: templateText(templateMessages.disableManagementMessage, locale),
+      confirmText: templateText(templateMessages.disableManagement, locale),
+      variant: 'danger',
+    });
+    if (!confirmed) return;
+    const saved = await runMutation('management-secret', () => clearCoreManagementSecretKey(), templateText(templateMessages.managementDisabled, locale));
+    if (saved) { setManagementSecretDraft(''); setManagementSecretConfirm(''); setShowManagementSecret(false); setManagementSecretError(''); }
   };
 
   const submitApiKey = async (event: FormEvent) => {
@@ -493,8 +537,9 @@ export function ConfigPanelPage() {
     const editing = editingApiKey !== null;
     const saved = await runMutation(
       editing ? 'update-key' : 'add-key',
-      editing ? 'update_core_api_key' : 'add_core_api_key',
-      editing ? { originalApiKey: editingApiKey, apiKey, remark } : { apiKey, remark },
+      () => editing
+        ? updateCoreApiKey({ originalApiKey: editingApiKey!, apiKey, remark })
+        : addCoreApiKey({ apiKey, remark }),
       editing ? t('config.notice.keyUpdated') : t('config.notice.keyAdded'),
     );
     if (saved) {
@@ -537,7 +582,7 @@ export function ConfigPanelPage() {
     setBusyAction('logging');
     setLoggingError('');
     try {
-      const result = await invoke<CoreConfigSettings>('save_core_logging_settings', {
+      const result = await saveCoreLoggingSettingsCommand({
         settings: {
           debug: debugDraft,
           commercialMode: commercialModeDraft,
@@ -551,7 +596,7 @@ export function ConfigPanelPage() {
       loggingDraftDirtyRef.current = false;
       applySettings(result, 'preserve');
       if (commercialModeChanged && coreStatus?.running) {
-        const status = await invoke<CoreStatus>('restart_core_process');
+        const status = await restartCoreProcess();
         publishStatus(status);
         loggingFeedback.showNotice({ key: 'config.diagnostics.notice.savedAndRestarted' }, 'success');
       } else {
@@ -567,11 +612,11 @@ export function ConfigPanelPage() {
     }
   };
 
-  const openCoreLogsDirectory = async () => {
+  const handleOpenCoreLogsDirectory = async () => {
     if (busyAction !== null) return;
     setBusyAction('open-logs');
     try {
-      await invoke<void>('open_core_logs_directory');
+      await openCoreLogsDirectory();
     } catch (error) {
       loggingFeedback.showNotice({ key: 'config.diagnostics.error.openLogs', variables: { error: String(error) } }, 'error');
     } finally {
@@ -585,8 +630,7 @@ export function ConfigPanelPage() {
     }
     const deleted = await runMutation(
       'delete-key',
-      'delete_core_api_key',
-      { apiKey: selectedDeleteKey },
+      () => deleteCoreApiKey({ apiKey: selectedDeleteKey }),
       t('config.notice.keyDeleted'),
     );
     if (deleted) {
@@ -614,15 +658,17 @@ export function ConfigPanelPage() {
   const openWebUi = async () => {
     try {
       const [latestSettings, latestTlsSettings] = await Promise.all([
-        invoke<CoreConfigSettings>('get_core_config_settings'),
-        invoke<CoreTlsSettings>('get_core_tls_settings'),
+        getCoreConfigSettings(),
+        getCoreTlsSettings(),
       ]);
       applySettings(latestSettings, 'preserve');
       setTlsSettings(latestTlsSettings);
-      setTlsEnabledDraft(latestTlsSettings.enabled);
-      setTlsCertDraft(latestTlsSettings.cert);
-      setTlsKeyDraft(latestTlsSettings.key);
-      await invoke('open_external_url', {
+      if (!otherDraftDirtyRef.current.tls) {
+        setTlsEnabledDraft(latestTlsSettings.enabled);
+        setTlsCertDraft(latestTlsSettings.cert);
+        setTlsKeyDraft(latestTlsSettings.key);
+      }
+      await openExternalUrl({
         url: webUiManagementUrl(latestSettings.port, latestTlsSettings.enabled, latestSettings.host),
       });
     } catch (error) {
@@ -644,7 +690,7 @@ export function ConfigPanelPage() {
     setTlsError('');
     setTlsSavedStatusVisible(false);
     try {
-      const result = await invoke<CoreTlsSettings>('save_core_tls_settings', {
+      const result = await saveCoreTlsSettings({
         settings: { enabled: tlsEnabledDraft, cert, key },
       });
       setTlsSettings(result);
@@ -652,7 +698,7 @@ export function ConfigPanelPage() {
       setTlsCertDraft(result.cert);
       setTlsKeyDraft(result.key);
       if (coreStatus?.running) {
-        const status = await invoke<CoreStatus>('restart_core_process');
+        const status = await restartCoreProcess();
         publishStatus(status);
         tlsFeedback.showNotice({ key: 'config.tls.notice.savedAndRestarted' }, 'success');
       } else {
@@ -662,7 +708,7 @@ export function ConfigPanelPage() {
     } catch (error) {
       setTlsError(String(error));
       void refreshStatus();
-      void loadTlsSettings();
+      void loadTlsSettings('preserve');
     } finally {
       setBusyAction(null);
     }
@@ -702,8 +748,7 @@ export function ConfigPanelPage() {
     }
     await runMutation(
       'routing',
-      'set_core_routing_strategy',
-      { strategy },
+      () => setCoreRoutingStrategy({ strategy }),
       t('config.notice.routingUpdated'),
     );
   };
@@ -712,11 +757,6 @@ export function ConfigPanelPage() {
     networkFeedback.clearNotice();
     if (!settings || busyAction !== null) return;
     const host = hostDraft.trim();
-    if (!host) {
-      setHostError(t('config.error.hostRequired'));
-      networkFeedback.showNotice({ key: 'config.error.hostRequired' }, 'error');
-      return;
-    }
     const port = Number(portDraft);
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
       setPortError(t('config.error.portRange'));
@@ -730,7 +770,7 @@ export function ConfigPanelPage() {
     setPortError('');
     setBusyAction('network');
     try {
-      const result = await invoke<CoreConfigSettings>('save_network_endpoint_settings', {
+      const result = await saveNetworkEndpointSettingsCommand({
         settings: networkDraftDirtyRef.current.proxyUrl || networkDraftDirtyRef.current.proxyOverride
           ? { host, port, proxyUrl, proxyOverride: proxyOverrideDraft }
           : { host, port },
@@ -744,7 +784,7 @@ export function ConfigPanelPage() {
 
       if (networkChanged && coreStatus?.running) {
         try {
-          const status = await invoke<CoreStatus>('restart_core_process');
+          const status = await restartCoreProcess();
           publishStatus(status);
           networkFeedback.showNotice({ key: 'config.notice.networkRestarted' }, 'success');
         } catch (error) {
@@ -776,17 +816,17 @@ export function ConfigPanelPage() {
     const retryValues = retryDrafts.map(Number);
     if (
       retryDrafts.some((value) => value.length === 0)
-      || retryValues.some((value) => !Number.isInteger(value) || value < 0 || value > 4294967295)
+      || retryValues.some((value, index) => !Number.isInteger(value) || value < (index === 2 ? -2147483648 : 0) || value > (index === 2 ? 2147483647 : 4294967295))
     ) {
-      setRetryError(t('config.error.retryRange'));
-      retryFeedback.showNotice({ key: 'config.error.retryRange' }, 'error');
+      setRetryError(templateText(templateMessages.retryRange, locale));
+      retryFeedback.showNotice(templateText(templateMessages.retryRange, locale), 'error');
       return;
     }
     const [requestRetry, maxRetryCredentials, maxRetryInterval, streamingBootstrapRetries] = retryValues;
     setRetryError('');
     setBusyAction('retry');
     try {
-      const result = await invoke<CoreConfigSettings>('save_retry_settings', {
+      const result = await saveRetrySettingsCommand({
         settings: {
           disableCooling: disableCoolingDraft,
           requestRetry,
@@ -817,7 +857,7 @@ export function ConfigPanelPage() {
     const routingSessionAffinityTtl = sessionTtlDraft.trim();
     setBusyAction('routing');
     try {
-      const result = await invoke<CoreConfigSettings>('save_session_routing_settings', {
+      const result = await saveSessionRoutingSettingsCommand({
         settings: {
           routingSessionAffinity: sessionAffinityDraft,
           routingSessionAffinityTtl,
@@ -849,7 +889,7 @@ export function ConfigPanelPage() {
 
     setBusyAction('software');
     try {
-      const result = await invoke<SoftwareSettings>('save_software_settings', {
+      const result = await saveSoftwareSettingsCommand({
         settings: {
           closeBehavior: softwareCloseBehaviorDraft,
           autostartEnabled: softwareAutostartDraft,
@@ -866,14 +906,9 @@ export function ConfigPanelPage() {
       setSoftwareDefaultTerminalDraft(result.defaultTerminal);
       setSoftwareSavedStatusVisible(true);
     } catch (error) {
-      setSoftwareCloseBehaviorDraft(softwareSettings.closeBehavior);
-      setSoftwareAutostartDraft(softwareSettings.autostartEnabled);
-      setSoftwareStartCoreDraft(softwareSettings.startCoreOnLaunch);
-      setSoftwareSilentStartDraft(softwareSettings.silentStartEnabled);
-      setSoftwareDefaultTerminalDraft(softwareSettings.defaultTerminal);
       setSoftwareSavedStatusVisible(false);
       softwareFeedback.showNotice({ key: 'config.error.saveFailed', variables: { error: String(error) } }, 'error');
-      void loadSoftwareSettings();
+      void loadSoftwareSettings('preserve');
     } finally {
       setBusyAction(null);
     }
@@ -939,6 +974,7 @@ export function ConfigPanelPage() {
     || tlsCertDraft.trim() !== tlsSettings.cert
     || tlsKeyDraft.trim() !== tlsSettings.key
   );
+  otherDraftDirtyRef.current = { software: softwareSettingsDirty, tls: tlsSettingsDirty };
   const tlsStatusLabel = tlsSettingsLoading
     ? t('common.loading')
     : tlsSettings === null
@@ -958,124 +994,80 @@ export function ConfigPanelPage() {
   const keyMutationBusy = busyAction === 'add-key' || busyAction === 'update-key';
   const managementSecretBusy = busyAction === 'management-secret';
   const loggingSettingsBusy = busyAction === 'logging';
-  const addDialogRef = useDialogFocusTrap<HTMLFormElement>({
-    active: addDialogOpen,
-    onEscape: keyMutationBusy ? undefined : closeAddDialog,
-    preventEscape: keyMutationBusy,
-  });
-  const deleteDialogRef = useDialogFocusTrap<HTMLDivElement>({
-    active: deleteIndex !== null,
-    onEscape: busyAction === 'delete-key' ? undefined : () => setDeleteIndex(null),
-    preventEscape: busyAction === 'delete-key',
-  });
   const activateConfigSubpage = (subpage: ConfigSubpage) => {
-    if (subpage === 'sensitive-words') setSensitiveWordsVisited(true);
+    setSettingsSearch('');
     setActiveSubpage(subpage);
+    if (subpage === 'requests') {
+      setSensitiveWordsVisited(true);
+    }
+    if (subpage === 'aliases') setAliasesVisited(true);
   };
-  const handleConfigTabKeyDown = (event: KeyboardEvent<HTMLButtonElement>, subpage: ConfigSubpage) => {
-    handleHorizontalTabKey(
-      event,
-      CONFIG_SUBPAGES,
-      subpage,
-      activateConfigSubpage,
-      (next) => document.getElementById(`config-subpage-tab-${next}`),
-    );
+  const navigateToSetting = (destination: SettingDestination) => {
+    activateConfigSubpage(destination.category);
+    setPendingDestination(destination);
   };
+  useEffect(() => {
+    const destination = takeRequestedSettingField();
+    if (destination) navigateToSetting(destination);
+  }, []);
+  const nativeDirty = {
+    keys: false, management: Boolean(managementSecretDraft || managementSecretConfirm),
+    network: networkSettingsDirty, tls: tlsSettingsDirty, routing: sessionRoutingDirty,
+    retry: retrySettingsDirty, logging: loggingSettingsDirty, software: softwareSettingsDirty,
+  };
+  const nativeEntries: SettingSearchEntry[] = [
+    { category: 'general', target: 'config-native-keys', title: t('config.keys.title'), context: '', keywords: 'API key token 鉴权密钥 api-keys access' },
+    { category: 'general', target: 'config-native-management', title: t('config.webuiKey.title'), context: '', keywords: 'WebUI secret-key 密钥 管理接口 面板 密码 management security' },
+    { category: 'general', target: 'config-native-network', title: st('nativeNetwork'), context: '', keywords: [t('config.network.port'), t('config.network.listenHost'), t('config.network.proxyUrl'), t('config.network.systemProxy'), 'server host port proxy URL 8317 127.0.0.1 0.0.0.0 监听 地址 系统代理'].join(' ') },
+    { category: 'general', target: 'config-native-tls', title: t('config.tls.enable'), context: '', keywords: [t('config.tls.cert'), t('config.tls.key'), 'TLS HTTPS cert key certificate 证书 私钥 加密'].join(' ') },
+    { category: 'routing', target: 'config-native-routing', title: st('nativeRouting'), context: '', keywords: [t('config.network.sessionAffinity'), t('config.network.sessionTtl'), t('config.routing.title'), 'session affinity ttl routing strategy round-robin 会话 粘性 加权 轮询'].join(' ') },
+    { category: 'requests', target: 'config-native-retry', title: st('nativeRetry'), context: '', keywords: [t('config.network.enableCooling'), t('config.network.disableCooling'), t('config.network.requestRetry'), t('config.network.maxRetryCredentials'), t('config.network.maxRetryInterval'), t('config.network.streamingBootstrapRetries'), 'retry retries cooldown 重试 冷却 流式 失败 fallback'].join(' ') },
+    { category: 'diagnostics', target: 'config-native-logging', title: t('config.diagnostics.title'), context: '', keywords: [t('config.diagnostics.debug.title'), t('config.diagnostics.commercial.title'), t('config.diagnostics.fileLogging.title'), t('config.diagnostics.usage.title'), t('config.diagnostics.maxSize.title'), t('config.diagnostics.errorFiles.title'), t('config.diagnostics.redisRetention.title'), 'debug commercial-mode logging logs usage statistics redis retention 日志 调试 商业模式 用量 统计 留存 文件 容量'].join(' ') },
+    { category: 'software', target: 'config-native-software', title: t('config.software.title'), context: '', keywords: [t('config.software.autostart'), t('config.software.startCoreOnLaunch'), t('config.software.silentStart'), t('config.software.closeBehavior'), t('config.software.defaultTerminal'), 'startup autostart silent tray close terminal 软件 自启动 启动 静默 托盘 关闭 终端'].join(' ') },
+    { category: 'aliases', target: 'config-native-aliases', title: t('app.nav.thinkingAliases'), context: '', keywords: 'thinking reasoning speed aliases effort 思考 推理 速度 别名 模型' },
+    { category: 'requests', target: 'config-native-sensitive-words', title: t('config.sensitiveWords.title'), context: '', keywords: 'sensitive words filters antigravity devin 敏感词 内容 过滤' },
+  ];
+  const nativeCategoryDirty: Record<ConfigSubpage, boolean> = {
+    general: nativeDirty.management || networkSettingsDirty || tlsSettingsDirty,
+    aliases: false,
+    routing: sessionRoutingDirty,
+    requests: sensitiveWordsDirty || retrySettingsDirty,
+    diagnostics: loggingSettingsDirty,
+    oauth: false,
+    software: softwareSettingsDirty,
+  };
+  const categoryDirty = (id: ConfigSubpage) => nativeCategoryDirty[id]
+    || settingsTemplateGroups[id].some(group => dirtyTemplateGroups.includes(group.id));
+  const templateGroups = settingsTemplateGroups[activeSubpage];
+  const searchEntries: SettingSearchEntry[] = [
+    ...nativeEntries,
+    ...settingsCategories.flatMap(item => settingsTemplateGroups[item.id].flatMap(group => group.fields.map((field, index) => ({
+      category: item.id,
+      target: `config-group-${group.id}`, field: `template-field-${group.id}-${index}`,
+      title: templateText(field.label, locale), context: templateText(group.title, locale),
+      keywords: `${JSON.stringify(field)} ${templateText(group.description, locale)} ${field.path.join('.')}`,
+    })))),
+  ];
+  const searchTerms = settingsSearch.trim().toLocaleLowerCase().split(/\s+/);
+  const searchResults = searchEntries.filter(entry => {
+    const categoryTitle = templateText(settingsCategories.find(item => item.id === entry.category)!.title, locale);
+    const text = `${entry.title} ${entry.context} ${entry.keywords} ${categoryTitle}`.toLocaleLowerCase();
+    return searchTerms.every(term => text.includes(term));
+  });
 
   return (
-    <section className="page config-page">
-      <header className="management-header config-page-header">
-        <div><h1>{t('app.nav.config')}</h1></div>
-      </header>
-      <div className="agent-subpage-tabs config-subpage-tabs" role="tablist" aria-label={t('config.tabs.label')}>
-        <button
-          type="button"
-          id="config-subpage-tab-general"
-          role="tab"
-          className={activeSubpage === 'general' ? 'active' : ''}
-          aria-selected={activeSubpage === 'general'}
-          aria-controls="config-subpage-panel"
-          tabIndex={activeSubpage === 'general' ? 0 : -1}
-          onClick={() => activateConfigSubpage('general')}
-          onKeyDown={(event) => handleConfigTabKeyDown(event, 'general')}
-        >
-          {t('config.tabs.general')}
-        </button>
-        <button
-          type="button"
-          id="config-subpage-tab-network"
-          role="tab"
-          className={activeSubpage === 'network' ? 'active' : ''}
-          aria-selected={activeSubpage === 'network'}
-          aria-controls="config-subpage-panel"
-          tabIndex={activeSubpage === 'network' ? 0 : -1}
-          onClick={() => activateConfigSubpage('network')}
-          onKeyDown={(event) => handleConfigTabKeyDown(event, 'network')}
-        >
-          {t('config.tabs.network')}
-        </button>
-        <button
-          type="button"
-          id="config-subpage-tab-routing"
-          role="tab"
-          className={activeSubpage === 'routing' ? 'active' : ''}
-          aria-selected={activeSubpage === 'routing'}
-          aria-controls="config-subpage-panel"
-          tabIndex={activeSubpage === 'routing' ? 0 : -1}
-          onClick={() => activateConfigSubpage('routing')}
-          onKeyDown={(event) => handleConfigTabKeyDown(event, 'routing')}
-        >
-          {t('config.tabs.routing')}
-        </button>
-        <button
-          type="button"
-          id="config-subpage-tab-aliases"
-          role="tab"
-          className={activeSubpage === 'aliases' ? 'active' : ''}
-          aria-selected={activeSubpage === 'aliases'}
-          aria-controls="config-subpage-panel"
-          tabIndex={activeSubpage === 'aliases' ? 0 : -1}
-          onClick={() => activateConfigSubpage('aliases')}
-          onKeyDown={(event) => handleConfigTabKeyDown(event, 'aliases')}
-        >
-          {t('app.nav.thinkingAliases')}
-        </button>
-        <button
-          type="button"
-          id="config-subpage-tab-software"
-          role="tab"
-          className={activeSubpage === 'software' ? 'active' : ''}
-          aria-selected={activeSubpage === 'software'}
-          aria-controls="config-subpage-panel"
-          tabIndex={activeSubpage === 'software' ? 0 : -1}
-          onClick={() => activateConfigSubpage('software')}
-          onKeyDown={(event) => handleConfigTabKeyDown(event, 'software')}
-        >
-          {t('config.tabs.software')}
-        </button>
-        <button
-          type="button"
-          id="config-subpage-tab-sensitive-words"
-          role="tab"
-          className={activeSubpage === 'sensitive-words' ? 'active' : ''}
-          aria-selected={activeSubpage === 'sensitive-words'}
-          aria-controls="config-subpage-panel"
-          tabIndex={activeSubpage === 'sensitive-words' ? 0 : -1}
-          onClick={() => activateConfigSubpage('sensitive-words')}
-          onKeyDown={(event) => handleConfigTabKeyDown(event, 'sensitive-words')}
-        >
-          {t('config.tabs.sensitiveWords')}
-        </button>
-      </div>
-
-      {activeSubpage === 'general' ? (
-        <div
-          className="config-subpage-panel config-general-subpage"
-          id="config-subpage-panel"
-          role="tabpanel"
-          aria-labelledby="config-subpage-tab-general"
-        >
-        <section className="panel config-keys-panel">
+    <section className="page config-page" aria-label={st('title')}>
+      {confirmationDialog}
+      <div className="config-settings-layout">
+        <div className="config-settings-topnav">
+          <Tabs ref={categoryNavigationRef} className="config-subpage-tabs secondary-page-tabs" aria-label={t('config.tabs.label')} value={activeSubpage} onChange={activateConfigSubpage}
+            items={settingsCategories.map(item => ({ value: item.id, id: `config-subpage-tab-${item.id}`, panelId: 'config-subpage-panel', label: <><span>{templateText(item.title, locale)}</span>{categoryDirty(item.id) ? <span className="config-nav-dirty" title={st('dirty')}><span className="sr-only">{st('dirty')}</span></span> : null}</> }))} />
+          <div className="config-settings-search search-control" data-size="default"><Search size={18} aria-hidden="true" /><input ref={searchRef} type="search" aria-label={st('search')} placeholder={st('searchHint')} value={settingsSearch} onChange={event => setSettingsSearch(event.currentTarget.value)} onKeyDown={event => { if (event.key === 'Escape') setSettingsSearch(''); }} />{searching ? <button type="button" className="icon-button quiet tiny-button" aria-label={st('clearSearch')} onClick={() => { setSettingsSearch(''); searchRef.current?.focus(); }}><X size={16} /></button> : null}</div>
+        </div>
+        <div className="config-settings-content" id="config-subpage-panel" role="tabpanel" aria-labelledby={`config-subpage-tab-${activeSubpage}`}>
+          {searching ? <section className="config-search-results" aria-label={st('results')}><div className="config-search-heading"><h2>{st('results')}</h2><span role="status">{searchResults.length}</span></div>{searchResults.length ? <div className="surface-card config-search-result-list">{searchResults.map(entry => <button type="button" key={`${entry.target}-${entry.field ?? ''}`} onClick={() => navigateToSetting(entry)}><span className="config-search-result-copy"><strong>{entry.title}</strong><small>{templateText(settingsCategories.find(item => item.id === entry.category)!.title, locale)}{entry.context ? ` / ${entry.context}` : ''}</small></span><ChevronRight size={17} aria-hidden="true" /></button>)}</div> : <EmptyState variant="box" className="config-search-empty">{st('noResults')}</EmptyState>}</section> : null}
+          <div className="config-settings-cards">
+<section id="config-native-keys" tabIndex={-1} hidden={searching || activeSubpage !== 'general'} className="panel surface-card config-keys-panel">
           <div className="config-panel-heading">
             <div className="config-heading-title">
               <KeyRound size={18} aria-hidden="true" />
@@ -1107,15 +1099,13 @@ export function ConfigPanelPage() {
                 </div>
               ))
             ) : loadError ? (
-              <div className="config-unavailable">
-                <AlertCircle size={24} aria-hidden="true" />
-                <strong>{t('config.unavailable')}</strong>
-                <span title={loadError}>{loadError}</span>
-                <button type="button" className="secondary-button compact-button" onClick={() => void loadSettings()}>
+              <EmptyState className="config-unavailable" tone="error" icon={<AlertCircle size={24} />} title={t('config.unavailable')}
+                action={<button type="button" className="secondary-button compact-button" onClick={() => void loadSettings()}>
                   <RefreshCw size={16} aria-hidden="true" />
                   {t('common.retry')}
-                </button>
-              </div>
+                </button>}>
+                <span title={loadError}>{loadError}</span>
+              </EmptyState>
             ) : settings && settings.apiKeys.length > 0 ? (
               settings.apiKeys.map((entry, index) => (
                 <div className="config-key-row" key={`${index}-${entry.apiKey}`}>
@@ -1133,7 +1123,7 @@ export function ConfigPanelPage() {
                   <div className="config-key-actions">
                     <button
                       type="button"
-                      className="icon-button quiet"
+                      className="icon-button quiet small-button"
                       onClick={() => void copyApiKey(entry.apiKey, index)}
                       disabled={controlsDisabled}
                       title={copiedIndex === index ? t('config.notice.keyCopied') : t('config.keys.copy')}
@@ -1147,7 +1137,7 @@ export function ConfigPanelPage() {
                     </button>
                     <button
                       type="button"
-                      className="icon-button quiet"
+                      className="icon-button quiet small-button"
                       onClick={() => openEditDialog(entry)}
                       disabled={controlsDisabled}
                       title={t('config.keys.edit')}
@@ -1157,7 +1147,7 @@ export function ConfigPanelPage() {
                     </button>
                     <button
                       type="button"
-                      className="icon-button danger"
+                      className="icon-button danger small-button"
                       onClick={() => setDeleteIndex(index)}
                       disabled={controlsDisabled}
                       title={t('config.keys.delete')}
@@ -1169,19 +1159,16 @@ export function ConfigPanelPage() {
                 </div>
               ))
             ) : (
-              <div className="config-empty-list">
-                <KeyRound size={26} aria-hidden="true" />
-                <strong>{t('config.keys.empty')}</strong>
-              </div>
+              <EmptyState className="config-empty-list" icon={<KeyRound size={26} />} title={t('config.keys.empty')} />
             )}
           </div>
           {!addDialogOpen && deleteIndex === null ? renderFeedback(keyFeedback) : null}
         </section>
-        <section className="panel config-management-panel">
+<section id="config-native-management" tabIndex={-1} hidden={searching || activeSubpage !== 'general'} className="panel surface-card config-management-panel">
           <div className="config-panel-heading">
             <div className="config-heading-title">
               <ShieldCheck size={18} aria-hidden="true" />
-              <h2>{t('config.webuiKey.title')}</h2>
+              <h2>{t('config.webuiKey.title')}</h2><SettingsHelp label={t('config.webuiKey.title')}>{t('config.webuiKey.description')} {t('config.webuiKey.securityHint')}</SettingsHelp>
             </div>
             <div className="config-heading-actions">
               <button
@@ -1197,11 +1184,7 @@ export function ConfigPanelPage() {
           </div>
 
           <div className="config-management-content">
-            <div className="config-management-description">
-              <strong>{t('config.webuiKey.heading')}</strong>
-              <p>{t('config.webuiKey.description')}</p>
-              <small>{t('config.webuiKey.securityHint')}</small>
-            </div>
+            {settings?.managementSecretConfigured === false ? <p role="status">{templateText(templateMessages.managementDisabled, locale)}</p> : null}
 
             <form
               className="config-management-form"
@@ -1266,6 +1249,9 @@ export function ConfigPanelPage() {
                   {managementSecretError || ' '}
                 </span>
                 <div className="config-management-actions">
+                  <button type="button" className="secondary-button compact-button" disabled={controlsDisabled || settings?.managementSecretConfigured === false} onClick={() => void disableManagement()}>
+                    {templateText(templateMessages.disableManagement, locale)}
+                  </button>
                   <button
                     type="button"
                     className="secondary-button compact-button"
@@ -1288,228 +1274,24 @@ export function ConfigPanelPage() {
             {renderFeedback(managementFeedback)}
           </div>
         </section>
-
-        <section className="panel config-diagnostics-panel">
-          <div className="config-panel-heading">
-            <div className="config-heading-title">
-              <FileText size={18} aria-hidden="true" />
-              <h2>{t('config.diagnostics.title')}</h2>
-            </div>
-          </div>
-
-          <p className="config-diagnostics-intro">
-            {t('config.diagnostics.description').split('**').map((part, index) => (
-              index % 2 === 1 ? <strong key={index}>{part}</strong> : part
-            ))}
-          </p>
-
-          <div className="config-diagnostics-toggle-grid">
-            <div className="config-diagnostics-setting">
-              <span className="config-diagnostics-setting-icon" aria-hidden="true"><Bug size={18} /></span>
-              <div className="config-diagnostics-setting-copy">
-                <strong>{t('config.diagnostics.debug.title')}</strong>
-                <small>{t('config.diagnostics.debug.description')}</small>
-              </div>
-              <label className="switch-control" title={t('config.diagnostics.debug.title')}>
-                <input
-                  type="checkbox"
-                  role="switch"
-                  checked={debugDraft}
-                  disabled={controlsDisabled}
-                  onChange={(event) => {
-                    setDebugDraft(event.currentTarget.checked);
-                    markLoggingDraftDirty();
-                  }}
-                />
-                <span className="switch-track" />
-              </label>
-            </div>
-
-            <div className="config-diagnostics-setting">
-              <span className="config-diagnostics-setting-icon" aria-hidden="true"><Gauge size={18} /></span>
-              <div className="config-diagnostics-setting-copy">
-                <strong>{t('config.diagnostics.commercial.title')}</strong>
-                <small>{t('config.diagnostics.commercial.description')}</small>
-              </div>
-              <label className="switch-control" title={t('config.diagnostics.commercial.title')}>
-                <input
-                  type="checkbox"
-                  role="switch"
-                  checked={commercialModeDraft}
-                  disabled={controlsDisabled}
-                  onChange={(event) => {
-                    setCommercialModeDraft(event.currentTarget.checked);
-                    markLoggingDraftDirty();
-                  }}
-                />
-                <span className="switch-track" />
-              </label>
-            </div>
-
-            <div className="config-diagnostics-setting">
-              <span className="config-diagnostics-setting-icon" aria-hidden="true"><HardDrive size={18} /></span>
-              <div className="config-diagnostics-setting-copy">
-                <strong>{t('config.diagnostics.fileLogging.title')}</strong>
-                <small>{t('config.diagnostics.fileLogging.description')}</small>
-              </div>
-              <label className="switch-control" title={t('config.diagnostics.fileLogging.title')}>
-                <input
-                  type="checkbox"
-                  role="switch"
-                  checked={loggingToFileDraft}
-                  disabled={controlsDisabled}
-                  onChange={(event) => {
-                    setLoggingToFileDraft(event.currentTarget.checked);
-                    markLoggingDraftDirty();
-                  }}
-                />
-                <span className="switch-track" />
-              </label>
-            </div>
-
-            <div className="config-diagnostics-setting">
-              <span className="config-diagnostics-setting-icon" aria-hidden="true"><Database size={18} /></span>
-              <div className="config-diagnostics-setting-copy">
-                <strong>{t('config.diagnostics.usage.title')}</strong>
-                <small>{t('config.diagnostics.usage.description')}</small>
-              </div>
-              <label className="switch-control" title={t('config.diagnostics.usage.title')}>
-                <input
-                  type="checkbox"
-                  role="switch"
-                  checked={usageStatisticsDraft}
-                  disabled={controlsDisabled}
-                  onChange={(event) => {
-                    setUsageStatisticsDraft(event.currentTarget.checked);
-                    markLoggingDraftDirty();
-                  }}
-                />
-                <span className="switch-track" />
-              </label>
-            </div>
-          </div>
-
-          <div className="config-diagnostics-fields">
-            <label className="config-diagnostics-field">
-              <span>{t('config.diagnostics.maxSize.title')}</span>
-              <input
-                className="config-dialog-text-input"
-                type="number"
-                min="0"
-                step="1"
-                value={logsMaxTotalSizeDraft}
-                disabled={controlsDisabled}
-                onChange={(event) => {
-                  setLogsMaxTotalSizeDraft(event.currentTarget.value);
-                  markLoggingDraftDirty();
-                }}
-              />
-              <small>{t('config.diagnostics.maxSize.hint')}</small>
-            </label>
-            <label className="config-diagnostics-field">
-              <span>{t('config.diagnostics.errorFiles.title')}</span>
-              <input
-                className="config-dialog-text-input"
-                type="number"
-                min="0"
-                step="1"
-                value={errorLogsMaxFilesDraft}
-                disabled={controlsDisabled}
-                onChange={(event) => {
-                  setErrorLogsMaxFilesDraft(event.currentTarget.value);
-                  markLoggingDraftDirty();
-                }}
-              />
-              <small>{t('config.diagnostics.errorFiles.hint')}</small>
-            </label>
-            <label className="config-diagnostics-field">
-              <span>{t('config.diagnostics.redisRetention.title')}</span>
-              <input
-                className="config-dialog-text-input"
-                type="number"
-                min="1"
-                max="3600"
-                step="1"
-                value={redisUsageRetentionDraft}
-                disabled={controlsDisabled}
-                onChange={(event) => {
-                  setRedisUsageRetentionDraft(event.currentTarget.value);
-                  markLoggingDraftDirty();
-                }}
-              />
-              <small>{t('config.diagnostics.redisRetention.hint')}</small>
-            </label>
-          </div>
-
-          {commercialModeDraft ? (
-            <div className="config-diagnostics-commercial-note">
-              <AlertCircle size={16} aria-hidden="true" />
-              <span>{t('config.diagnostics.commercial.warning')}</span>
-            </div>
-          ) : null}
-
-          <div className="config-diagnostics-footer">
-            <span className={`config-form-message ${loggingError ? 'error' : ''}`} role="alert">
-              {loggingError || ' '}
-            </span>
-            <div className="config-diagnostics-actions">
-              <button
-                type="button"
-                className="secondary-button compact-button"
-                disabled={controlsDisabled}
-                onClick={() => void openCoreLogsDirectory()}
-              >
-                <FolderOpen size={16} aria-hidden="true" />
-                {t('config.diagnostics.openLogs')}
-              </button>
-              <button
-                type="button"
-                className="primary-button compact-button"
-                disabled={controlsDisabled || !loggingSettingsDirty}
-                onClick={() => void saveCoreLoggingSettings()}
-              >
-                <Check size={16} aria-hidden="true" />
-                {loggingSettingsBusy ? t('common.saving') : t('config.diagnostics.save')}
-              </button>
-            </div>
-            {renderFeedback(loggingFeedback)}
-          </div>
-        </section>
-        </div>
-      ) : activeSubpage === 'network' || activeSubpage === 'routing' ? (
-        <div
-          className="config-subpage-panel config-network-subpage"
-          id="config-subpage-panel"
-          role="tabpanel"
-          aria-labelledby={`config-subpage-tab-${activeSubpage}`}
-        >
-      <div className="config-network-panel">
-        <div className="config-network-sections">
-          <section
-            className="config-network-section"
+<section id="config-native-network" tabIndex={-1} hidden={searching || activeSubpage !== 'general'}
+            className="surface-card config-network-section"
             aria-labelledby="config-network-section-title"
-            hidden={activeSubpage !== 'network'}
           >
             <div className="config-network-section-heading config-section-heading-with-actions">
               <div className="config-network-section-title">
                 <Network size={16} aria-hidden="true" />
-                <h3 id="config-network-section-title">{t('config.network.networkSection')}</h3>
+                <h3 id="config-network-section-title">{st('nativeNetwork')}</h3>
               </div>
-              <button
-                type="button"
-                className="primary-button compact-button"
-                disabled={controlsDisabled || !networkSettingsDirty}
-                onClick={() => void saveNetworkEndpointSettings()}
-              >
-                <Check size={16} aria-hidden="true" />
-                {busyAction === 'network' ? t('common.saving') : t('config.network.confirmSave')}
-              </button>
+              <span className="config-card-status" role="status">{nativeDirty.network ? st('dirty') : ''}</span>
+
             </div>
             {renderFeedback(networkFeedback)}
             <div className="config-network-grid">
-              <label className="config-network-field config-network-port-field">
-            <span>{t('config.network.port')}</span>
+              <div className="config-network-field config-network-port-field">
+            <span className="config-field-label"><label htmlFor="config-input-config-network-port">{t('config.network.port')}</label><SettingsHelp label={t('config.network.port')}>{t('config.network.portHint')}</SettingsHelp></span>
             <input
+                  id="config-input-config-network-port"
               className={`config-network-input ${portError ? 'error' : ''}`}
               type="text"
               inputMode="numeric"
@@ -1533,19 +1315,20 @@ export function ConfigPanelPage() {
                 }
               }}
             />
-            <small>{t('config.network.portHint')}</small>
-              </label>
 
-              <label className="config-network-field">
-                <span>{t('config.network.listenHost')}</span>
+              </div>
+
+              <div className="config-network-field">
+                <span className="config-field-label"><label htmlFor="config-input-config-network-listenHost">{t('config.network.listenHost')}</label><SettingsHelp label={t('config.network.listenHost')}>{templateText(templateMessages.hostHint, locale)}</SettingsHelp></span>
                 <input
+                  id="config-input-config-network-listenHost"
                   className={`config-network-input ${hostError ? 'error' : ''}`}
                   type="text"
                   value={hostDraft}
                   disabled={controlsDisabled}
                   placeholder="127.0.0.1"
                   aria-invalid={Boolean(hostError)}
-                  title={hostError || t('config.network.listenHostHint')}
+                  title={hostError || templateText(templateMessages.hostHint, locale)}
                   onChange={(event) => {
                     markDraftDirty('host');
                     setHostDraft(event.currentTarget.value);
@@ -1560,8 +1343,8 @@ export function ConfigPanelPage() {
                     }
                   }}
                 />
-                <small>{t('config.network.listenHostHint')}</small>
-              </label>
+
+              </div>
 
               <div className="config-network-field config-proxy-field">
                 <div className="config-proxy-heading">
@@ -1569,20 +1352,13 @@ export function ConfigPanelPage() {
                     <Link2 size={15} aria-hidden="true" />
                     {t('config.network.proxyUrl')}
                   </label>
+                  <SettingsHelp label={t('config.network.proxyUrl')}>{t('config.network.proxyHint')} {t('config.network.systemProxyHint')}</SettingsHelp>
                   <label className="config-proxy-system-toggle" title={t('config.network.systemProxyHint')}>
                     <span>{t('config.network.systemProxy')}</span>
-                    <span className="switch-control">
-                      <input
-                        type="checkbox"
-                        checked={!proxyOverrideDraft}
-                        disabled={controlsDisabled}
-                        onChange={(event) => {
+                    <Switch checked={!proxyOverrideDraft} disabled={controlsDisabled} onChange={(event) => {
                           markDraftDirty('proxyOverride');
                           setProxyOverrideDraft(!event.currentTarget.checked);
-                        }}
-                      />
-                      <span className="switch-track" />
-                    </span>
+                        }} />
                   </label>
                 </div>
                 <input
@@ -1604,270 +1380,23 @@ export function ConfigPanelPage() {
                     }
                   }}
                 />
-                <small>{t('config.network.proxyHint')}</small>
+
               </div>
             </div>
-          </section>
 
-          <section
-            className="config-network-section"
-            aria-labelledby="config-routing-section-title"
-            hidden={activeSubpage !== 'routing'}
-          >
-            <div className="config-network-section-heading config-section-heading-with-actions">
-              <div className="config-network-section-title">
-                <Route size={16} aria-hidden="true" />
-                <h3 id="config-routing-section-title">{t('config.network.routingSection')}</h3>
-              </div>
-              <button
+          <div className="config-settings-save-row"><button
                 type="button"
                 className="primary-button compact-button"
-                disabled={controlsDisabled || !sessionRoutingDirty}
-                onClick={() => void saveSessionRoutingSettings()}
+                disabled={controlsDisabled || !networkSettingsDirty}
+                onClick={() => void saveNetworkEndpointSettings()}
               >
                 <Check size={16} aria-hidden="true" />
-                {busyAction === 'routing' ? t('common.saving') : t('config.network.confirmSave')}
-              </button>
-            </div>
-            {renderFeedback(routingFeedback)}
-            <div className="config-network-grid">
-              <div className="config-network-field config-network-toggle">
-                <div>
-                  <span>{t('config.network.sessionAffinity')}</span>
-                  <small>{t('config.network.sessionAffinityHint')}</small>
-                </div>
-                <label className="switch-control" title={t('config.network.sessionAffinity')}>
-                  <input
-                    type="checkbox"
-                    aria-label={t('config.network.sessionAffinity')}
-                    checked={sessionAffinityDraft}
-                    disabled={controlsDisabled}
-                    onChange={(event) => {
-                      markDraftDirty('sessionAffinity');
-                      setSessionAffinityDraft(event.currentTarget.checked);
-                    }}
-                  />
-                  <span className="switch-track" />
-                </label>
-              </div>
-
-              <label className="config-network-field">
-                <span className="config-network-label">
-                  <Clock3 size={15} aria-hidden="true" />
-                  {t('config.network.sessionTtl')}
-                </span>
-                <input
-                  className="config-network-input"
-                  type="text"
-                  value={sessionTtlDraft}
-                  disabled={controlsDisabled}
-                  placeholder="1h"
-                  onChange={(event) => {
-                    markDraftDirty('sessionTtl');
-                    setSessionTtlDraft(event.currentTarget.value);
-                  }}
-                  onKeyDown={(event) => {
-                    if (event.key === 'Escape' && settings) {
-                      clearDraftDirty('sessionTtl');
-                      setSessionTtlDraft(settings.routingSessionAffinityTtl);
-                      event.currentTarget.blur();
-                    }
-                  }}
-                />
-                <small>{t('config.network.sessionTtlHint')}</small>
-              </label>
-
-              <div className="config-network-field config-network-routing-field">
-                <span className="config-network-label">
-                  <Route size={15} aria-hidden="true" />
-                  {t('config.routing.title')}
-                </span>
-                <div className="routing-segmented" role="group" aria-label={t('config.routing.title')}>
-                  {ROUTING_OPTIONS.map((option) => (
-                    <button
-                      type="button"
-                      key={option.value}
-                      className={settings?.routingStrategy === option.value ? 'active' : ''}
-                      aria-pressed={settings?.routingStrategy === option.value}
-                      disabled={controlsDisabled}
-                      onClick={() => void changeRoutingStrategy(option.value)}
-                      title={option.value}
-                    >
-                      {t(option.labelKey)}
-                    </button>
-                  ))}
-                </div>
-                <small title={settings?.routingStrategy || undefined}>
-                  {loading
-                    ? t('common.loading')
-                    : settings === null
-                      ? t('common.unavailable')
-                      : routingStrategyLabel(settings.routingStrategy, t)}
-                </small>
-              </div>
-            </div>
-          </section>
-
-          <section
-            className="config-network-section"
-            aria-labelledby="config-retry-section-title"
-            hidden={activeSubpage !== 'network'}
-          >
-            <div className="config-network-section-heading config-section-heading-with-actions">
-              <div className="config-network-section-title">
-                <RefreshCw size={16} aria-hidden="true" />
-                <h3 id="config-retry-section-title">{t('config.network.retrySection')}</h3>
-              </div>
-              <button
-                type="button"
-                className="primary-button compact-button"
-                disabled={controlsDisabled || !retrySettingsDirty}
-                onClick={() => void saveRetrySettings()}
-              >
-                <Check size={16} aria-hidden="true" />
-                {busyAction === 'retry' ? t('common.saving') : t('config.network.confirmSave')}
-              </button>
-            </div>
-            {renderFeedback(retryFeedback)}
-            <div className="config-network-grid">
-              <div className="config-network-field config-network-toggle">
-                <div>
-                  <span>{t('config.network.disableCooling')}</span>
-                  <small>{t('config.network.disableCoolingHint')}</small>
-                </div>
-                <label className="switch-control" title={t('config.network.disableCooling')}>
-                  <input
-                    type="checkbox"
-                    role="switch"
-                    aria-label={t('config.network.disableCooling')}
-                    checked={disableCoolingDraft}
-                    disabled={controlsDisabled}
-                    onChange={(event) => {
-                      markDraftDirty('disableCooling');
-                      setDisableCoolingDraft(event.currentTarget.checked);
-                    }}
-                  />
-                  <span className="switch-track" />
-                </label>
-              </div>
-
-              <label className="config-network-field">
-                <span>{t('config.network.requestRetry')}</span>
-                <input
-                  className={`config-network-input ${retryError ? 'error' : ''}`}
-                  type="text"
-                  inputMode="numeric"
-                  pattern="[0-9]*"
-                  maxLength={10}
-                  value={requestRetryDraft}
-                  disabled={controlsDisabled}
-                  aria-invalid={Boolean(retryError)}
-                  onChange={(event) => {
-                    markDraftDirty('requestRetry');
-                    setRequestRetryDraft(event.currentTarget.value.replace(/\D/g, '').slice(0, 10));
-                    setRetryError('');
-                  }}
-                  onKeyDown={(event) => {
-                    if (event.key === 'Escape' && settings) {
-                      clearDraftDirty('requestRetry');
-                      setRequestRetryDraft(String(settings.requestRetry));
-                      setRetryError('');
-                      event.currentTarget.blur();
-                    }
-                  }}
-                />
-                <small>{t('config.network.requestRetryHint')}</small>
-              </label>
-
-              <label className="config-network-field">
-                <span>{t('config.network.maxRetryCredentials')}</span>
-                <input
-                  className={`config-network-input ${retryError ? 'error' : ''}`}
-                  type="text"
-                  inputMode="numeric"
-                  pattern="[0-9]*"
-                  maxLength={10}
-                  value={maxRetryCredentialsDraft}
-                  disabled={controlsDisabled}
-                  aria-invalid={Boolean(retryError)}
-                  onChange={(event) => {
-                    markDraftDirty('maxRetryCredentials');
-                    setMaxRetryCredentialsDraft(event.currentTarget.value.replace(/\D/g, '').slice(0, 10));
-                    setRetryError('');
-                  }}
-                  onKeyDown={(event) => {
-                    if (event.key === 'Escape' && settings) {
-                      clearDraftDirty('maxRetryCredentials');
-                      setMaxRetryCredentialsDraft(String(settings.maxRetryCredentials));
-                      setRetryError('');
-                      event.currentTarget.blur();
-                    }
-                  }}
-                />
-                <small>{t('config.network.maxRetryCredentialsHint')}</small>
-              </label>
-
-              <label className="config-network-field">
-                <span>{t('config.network.maxRetryInterval')}</span>
-                <input
-                  className={`config-network-input ${retryError ? 'error' : ''}`}
-                  type="text"
-                  inputMode="numeric"
-                  pattern="[0-9]*"
-                  maxLength={10}
-                  value={maxRetryIntervalDraft}
-                  disabled={controlsDisabled}
-                  aria-invalid={Boolean(retryError)}
-                  onChange={(event) => {
-                    markDraftDirty('maxRetryInterval');
-                    setMaxRetryIntervalDraft(event.currentTarget.value.replace(/\D/g, '').slice(0, 10));
-                    setRetryError('');
-                  }}
-                  onKeyDown={(event) => {
-                    if (event.key === 'Escape' && settings) {
-                      clearDraftDirty('maxRetryInterval');
-                      setMaxRetryIntervalDraft(String(settings.maxRetryInterval));
-                      setRetryError('');
-                      event.currentTarget.blur();
-                    }
-                  }}
-                />
-                <small>{t('config.network.maxRetryIntervalHint')}</small>
-              </label>
-
-              <label className="config-network-field">
-                <span>{t('config.network.streamingBootstrapRetries')}</span>
-                <input
-                  className={`config-network-input ${retryError ? 'error' : ''}`}
-                  type="text"
-                  inputMode="numeric"
-                  pattern="[0-9]*"
-                  maxLength={10}
-                  value={streamingBootstrapRetriesDraft}
-                  disabled={controlsDisabled}
-                  aria-invalid={Boolean(retryError)}
-                  onChange={(event) => {
-                    markDraftDirty('streamingBootstrapRetries');
-                    setStreamingBootstrapRetriesDraft(event.currentTarget.value.replace(/\D/g, '').slice(0, 10));
-                    setRetryError('');
-                  }}
-                  onKeyDown={(event) => {
-                    if (event.key === 'Escape' && settings) {
-                      clearDraftDirty('streamingBootstrapRetries');
-                      setStreamingBootstrapRetriesDraft(String(settings.streamingBootstrapRetries));
-                      setRetryError('');
-                      event.currentTarget.blur();
-                    }
-                  }}
-                />
-                <small>{t('config.network.streamingBootstrapRetriesHint')}</small>
-              </label>
-            </div>
-          </section>
-          <section
-            className="config-network-section"
+                {busyAction === 'network' ? t('common.saving') : t('common.save')}
+              </button></div>
+        </section>
+<section id="config-native-tls" tabIndex={-1} hidden={searching || activeSubpage !== 'general'}
+            className="surface-card config-network-section"
             aria-labelledby="config-tls-section-title"
-            hidden={activeSubpage !== 'network'}
           >
           <div className="config-network-section-heading config-tls-section-heading">
             <div className="config-tls-section-title">
@@ -1880,15 +1409,7 @@ export function ConfigPanelPage() {
                   {tlsStatusLabel}
                 </span>
               ) : null}
-              <button
-                type="button"
-                className="primary-button compact-button"
-                disabled={tlsSettingsLoading || tlsSettings === null || busyAction !== null || tlsFileSelecting !== null || !tlsSettingsDirty}
-                onClick={() => void saveTlsSettings()}
-              >
-                <Check size={16} aria-hidden="true" />
-                {busyAction === 'tls' ? t('common.saving') : t('config.network.confirmSave')}
-              </button>
+
             </div>
           </div>
 
@@ -1899,31 +1420,21 @@ export function ConfigPanelPage() {
                   <ShieldCheck size={18} />
                 </span>
                 <div>
-                  <strong>{t('config.tls.enable')}</strong>
-                  <small>{t('config.tls.enableDescription')}</small>
+                  <span className="config-field-label"><strong>{t('config.tls.enable')}</strong><SettingsHelp label={t('config.tls.enable')}>{t('config.tls.enableDescription')} {t('config.tls.restartHint')}</SettingsHelp></span>
+
                 </div>
               </div>
-              <label className="switch-control" title={t('config.tls.enable')}>
-                <input
-                  type="checkbox"
-                  role="switch"
-                  aria-label={t('config.tls.enable')}
-                  checked={tlsEnabledDraft}
-                  disabled={tlsSettingsLoading || tlsSettings === null || busyAction !== null}
-                  onChange={(event) => {
+              <Switch title={t('config.tls.enable')} aria-label={t('config.tls.enable')} checked={tlsEnabledDraft} disabled={tlsSettingsLoading || tlsSettings === null || busyAction !== null} onChange={(event) => {
                     setTlsSavedStatusVisible(false);
                     setTlsError('');
                     setTlsEnabledDraft(event.currentTarget.checked);
-                  }}
-                />
-                <span className="switch-track" />
-              </label>
+                  }} />
             </div>
 
             {tlsEnabledDraft ? (
               <div className="config-tls-fields">
                 <div className="config-network-field">
-                  <span>{t('config.tls.cert')}</span>
+                  <span className="config-field-label"><span>{t('config.tls.cert')}</span><SettingsHelp label={t('config.tls.cert')}>{t('config.tls.certHint')}</SettingsHelp></span>
                   <div className="config-tls-path-control">
                     <input
                       className={`config-network-input ${tlsError && !tlsCertDraft.trim() ? 'error' : ''}`}
@@ -1949,10 +1460,10 @@ export function ConfigPanelPage() {
                       {tlsFileSelecting === 'cert' ? t('common.processing') : t('config.tls.browse')}
                     </button>
                   </div>
-                  <small>{t('config.tls.certHint')}</small>
+
                 </div>
                 <div className="config-network-field">
-                  <span>{t('config.tls.key')}</span>
+                  <span className="config-field-label"><span>{t('config.tls.key')}</span><SettingsHelp label={t('config.tls.key')}>{t('config.tls.keyHint')}</SettingsHelp></span>
                   <div className="config-tls-path-control">
                     <input
                       className={`config-network-input ${tlsError && !tlsKeyDraft.trim() ? 'error' : ''}`}
@@ -1978,27 +1489,400 @@ export function ConfigPanelPage() {
                       {tlsFileSelecting === 'key' ? t('common.processing') : t('config.tls.browse')}
                     </button>
                   </div>
-                  <small>{t('config.tls.keyHint')}</small>
+
                 </div>
               </div>
             ) : null}
 
             <MessageNotice message={tlsError} onDismiss={() => setTlsError('')} />
-            <div className="config-tls-message">{t('config.tls.restartHint')}</div>
+
             {renderFeedback(tlsFeedback)}
           </div>
+
+          <div className="config-settings-save-row"><button
+                type="button"
+                className="primary-button compact-button"
+                disabled={tlsSettingsLoading || tlsSettings === null || busyAction !== null || tlsFileSelecting !== null || !tlsSettingsDirty}
+                onClick={() => void saveTlsSettings()}
+              >
+                <Check size={16} aria-hidden="true" />
+                {busyAction === 'tls' ? t('common.saving') : t('common.save')}
+              </button></div>
         </section>
-        </div>
-      </div>
-        </div>
-      ) : activeSubpage === 'software' ? (
-        <div
-          className="config-subpage-panel"
-          id="config-subpage-panel"
-          role="tabpanel"
-          aria-labelledby="config-subpage-tab-software"
-        >
-          <section className="panel config-software-panel">
+<section id="config-native-routing" tabIndex={-1} hidden={searching || activeSubpage !== 'routing'}
+            className="surface-card config-network-section"
+            aria-labelledby="config-routing-section-title"
+          >
+            <div className="config-network-section-heading config-section-heading-with-actions">
+              <div className="config-network-section-title">
+                <Route size={16} aria-hidden="true" />
+                <h3 id="config-routing-section-title">{st('nativeRouting')}</h3>
+              </div>
+              <span className="config-card-status" role="status">{nativeDirty.routing ? st('dirty') : ''}</span>
+
+            </div>
+            {renderFeedback(routingFeedback)}
+            <div className="config-network-grid">
+              <div className="config-network-field config-network-toggle">
+                <div>
+                  <span className="config-field-label"><span>{t('config.network.sessionAffinity')}</span><SettingsHelp label={t('config.network.sessionAffinity')}>{t('config.network.sessionAffinityHint')}</SettingsHelp></span>
+
+                </div>
+                <Switch title={t('config.network.sessionAffinity')} aria-label={t('config.network.sessionAffinity')} checked={sessionAffinityDraft} disabled={controlsDisabled} onChange={(event) => {
+                      markDraftDirty('sessionAffinity');
+                      setSessionAffinityDraft(event.currentTarget.checked);
+                    }} />
+              </div>
+
+              <div className="config-network-field">
+                <span className="config-field-label"><label htmlFor="config-input-config-network-sessionTtl">
+                  <Clock3 size={15} aria-hidden="true" />
+                  {t('config.network.sessionTtl')}
+                </label><SettingsHelp label={t('config.network.sessionTtl')}>{t('config.network.sessionTtlHint')}</SettingsHelp></span>
+                <input
+                  id="config-input-config-network-sessionTtl"
+                  className="config-network-input"
+                  type="text"
+                  value={sessionTtlDraft}
+                  disabled={controlsDisabled}
+                  placeholder="1h"
+                  onChange={(event) => {
+                    markDraftDirty('sessionTtl');
+                    setSessionTtlDraft(event.currentTarget.value);
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Escape' && settings) {
+                      clearDraftDirty('sessionTtl');
+                      setSessionTtlDraft(settings.routingSessionAffinityTtl);
+                      event.currentTarget.blur();
+                    }
+                  }}
+                />
+
+              </div>
+
+              <div className="config-network-field config-network-routing-field">
+                <span className="config-network-label">
+                  <Route size={15} aria-hidden="true" />
+                  {t('config.routing.title')}
+                  <span className="config-inline-status">{st('automatic')}</span>
+                </span>
+                <SegmentedControl className="routing-segmented" aria-label={t('config.routing.title')} value={settings?.routingStrategy ?? ''}
+                  disabled={controlsDisabled} onChange={value => void changeRoutingStrategy(value)}
+                  items={ROUTING_OPTIONS.map(option => ({ value: option.value, title: option.value, label: option.value === 'weighted-round-robin' ? templateText(templateMessages.weighted, locale) : t(option.labelKey) }))} />
+                <small className="sr-only" title={settings?.routingStrategy || undefined}>
+                  {loading
+                    ? t('common.loading')
+                    : settings === null
+                      ? t('common.unavailable')
+                      : routingStrategyLabel(settings.routingStrategy, t, locale)}
+                </small>
+              </div>
+            </div>
+
+          <div className="config-settings-save-row"><button
+                type="button"
+                className="primary-button compact-button"
+                disabled={controlsDisabled || !sessionRoutingDirty}
+                onClick={() => void saveSessionRoutingSettings()}
+              >
+                <Check size={16} aria-hidden="true" />
+                {busyAction === 'routing' ? t('common.saving') : t('common.save')}
+              </button></div>
+        </section>
+<section id="config-native-retry" tabIndex={-1} hidden={searching || activeSubpage !== 'requests'}
+            className="surface-card config-network-section"
+            aria-labelledby="config-retry-section-title"
+          >
+            <div className="config-network-section-heading config-section-heading-with-actions">
+              <div className="config-network-section-title">
+                <RefreshCw size={16} aria-hidden="true" />
+                <h3 id="config-retry-section-title">{st('nativeRetry')}</h3>
+              </div>
+              <span className="config-card-status" role="status">{nativeDirty.retry ? st('dirty') : ''}</span>
+
+            </div>
+            {renderFeedback(retryFeedback)}
+            <div className="config-network-grid">
+              <CoolingToggle disabledCooling={disableCoolingDraft} disabled={controlsDisabled}
+                onChange={(value) => {
+                  markDraftDirty('disableCooling');
+                  setDisableCoolingDraft(value);
+                }} />
+
+              <div className="config-network-field">
+                <span className="config-field-label"><label htmlFor="config-input-config-network-requestRetry">{t('config.network.requestRetry')}</label><SettingsHelp label={t('config.network.requestRetry')}>{templateText(templateMessages.retryHint, locale)}</SettingsHelp></span>
+                <input
+                  id="config-input-config-network-requestRetry"
+                  className={`config-network-input ${retryError ? 'error' : ''}`}
+                  type="text"
+                  inputMode="numeric"
+                  pattern="[0-9]*"
+                  maxLength={10}
+                  value={requestRetryDraft}
+                  disabled={controlsDisabled}
+                  aria-invalid={Boolean(retryError)}
+                  onChange={(event) => {
+                    markDraftDirty('requestRetry');
+                    setRequestRetryDraft(event.currentTarget.value.replace(/\D/g, '').slice(0, 10));
+                    setRetryError('');
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Escape' && settings) {
+                      clearDraftDirty('requestRetry');
+                      setRequestRetryDraft(String(settings.requestRetry));
+                      setRetryError('');
+                      event.currentTarget.blur();
+                    }
+                  }}
+                />
+
+              </div>
+
+              <div className="config-network-field">
+                <span className="config-field-label"><label htmlFor="config-input-config-network-maxRetryCredentials">{t('config.network.maxRetryCredentials')}</label><SettingsHelp label={t('config.network.maxRetryCredentials')}>{templateText(templateMessages.credentialsHint, locale)}</SettingsHelp></span>
+                <input
+                  id="config-input-config-network-maxRetryCredentials"
+                  className={`config-network-input ${retryError ? 'error' : ''}`}
+                  type="text"
+                  inputMode="numeric"
+                  pattern="[0-9]*"
+                  maxLength={10}
+                  value={maxRetryCredentialsDraft}
+                  disabled={controlsDisabled}
+                  aria-invalid={Boolean(retryError)}
+                  onChange={(event) => {
+                    markDraftDirty('maxRetryCredentials');
+                    setMaxRetryCredentialsDraft(event.currentTarget.value.replace(/\D/g, '').slice(0, 10));
+                    setRetryError('');
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Escape' && settings) {
+                      clearDraftDirty('maxRetryCredentials');
+                      setMaxRetryCredentialsDraft(String(settings.maxRetryCredentials));
+                      setRetryError('');
+                      event.currentTarget.blur();
+                    }
+                  }}
+                />
+
+              </div>
+
+              <div className="config-network-field">
+                <span className="config-field-label"><label htmlFor="config-input-config-network-maxRetryInterval">{t('config.network.maxRetryInterval')}</label><SettingsHelp label={t('config.network.maxRetryInterval')}>{templateText(templateMessages.waitHint, locale)}</SettingsHelp></span>
+                <input
+                  id="config-input-config-network-maxRetryInterval"
+                  className={`config-network-input ${retryError ? 'error' : ''}`}
+                  type="text"
+                  inputMode="numeric"
+                  pattern="-?[0-9]*"
+                  maxLength={11}
+                  value={maxRetryIntervalDraft}
+                  disabled={controlsDisabled}
+                  aria-invalid={Boolean(retryError)}
+                  onChange={(event) => {
+                    markDraftDirty('maxRetryInterval');
+                    const raw = event.currentTarget.value;
+                    setMaxRetryIntervalDraft(`${raw.startsWith('-') ? '-' : ''}${raw.replace(/\D/g, '').slice(0, 10)}`);
+                    setRetryError('');
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Escape' && settings) {
+                      clearDraftDirty('maxRetryInterval');
+                      setMaxRetryIntervalDraft(String(settings.maxRetryInterval));
+                      setRetryError('');
+                      event.currentTarget.blur();
+                    }
+                  }}
+                />
+
+              </div>
+
+              <div className="config-network-field">
+                <span className="config-field-label"><label htmlFor="config-input-config-network-streamingBootstrapRetries">{t('config.network.streamingBootstrapRetries')}</label><SettingsHelp label={t('config.network.streamingBootstrapRetries')}>{t('config.network.streamingBootstrapRetriesHint')}</SettingsHelp></span>
+                <input
+                  id="config-input-config-network-streamingBootstrapRetries"
+                  className={`config-network-input ${retryError ? 'error' : ''}`}
+                  type="text"
+                  inputMode="numeric"
+                  pattern="[0-9]*"
+                  maxLength={10}
+                  value={streamingBootstrapRetriesDraft}
+                  disabled={controlsDisabled}
+                  aria-invalid={Boolean(retryError)}
+                  onChange={(event) => {
+                    markDraftDirty('streamingBootstrapRetries');
+                    setStreamingBootstrapRetriesDraft(event.currentTarget.value.replace(/\D/g, '').slice(0, 10));
+                    setRetryError('');
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Escape' && settings) {
+                      clearDraftDirty('streamingBootstrapRetries');
+                      setStreamingBootstrapRetriesDraft(String(settings.streamingBootstrapRetries));
+                      setRetryError('');
+                      event.currentTarget.blur();
+                    }
+                  }}
+                />
+
+              </div>
+            </div>
+
+          <div className="config-settings-save-row"><button
+                type="button"
+                className="primary-button compact-button"
+                disabled={controlsDisabled || !retrySettingsDirty}
+                onClick={() => void saveRetrySettings()}
+              >
+                <Check size={16} aria-hidden="true" />
+                {busyAction === 'retry' ? t('common.saving') : t('common.save')}
+              </button></div>
+        </section>
+<section id="config-native-logging" tabIndex={-1} hidden={searching || activeSubpage !== 'diagnostics'} className="panel surface-card config-diagnostics-panel">
+          <div className="config-panel-heading">
+            <div className="config-heading-title">
+              <FileText size={18} aria-hidden="true" />
+              <h2>{t('config.diagnostics.title')}</h2>
+            </div>
+          </div>
+
+          <div className="config-diagnostics-toggle-grid">
+            <div className="config-diagnostics-setting">
+              <span className="config-diagnostics-setting-icon" aria-hidden="true"><Bug size={18} /></span>
+              <div className="config-diagnostics-setting-copy">
+                <span className="config-field-label"><strong>{t('config.diagnostics.debug.title')}</strong><SettingsHelp label={t('config.diagnostics.debug.title')}>{t('config.diagnostics.debug.description')}</SettingsHelp></span>
+
+              </div>
+              <Switch title={t('config.diagnostics.debug.title')} checked={debugDraft} aria-label={t('config.diagnostics.debug.title')} disabled={controlsDisabled} onChange={(event) => {
+                    setDebugDraft(event.currentTarget.checked);
+                    markLoggingDraftDirty();
+                  }} />
+            </div>
+
+            <div className="config-diagnostics-setting">
+              <span className="config-diagnostics-setting-icon" aria-hidden="true"><Gauge size={18} /></span>
+              <div className="config-diagnostics-setting-copy">
+                <span className="config-field-label"><strong>{t('config.diagnostics.commercial.title')}</strong><SettingsHelp label={t('config.diagnostics.commercial.title')}>{t('config.diagnostics.commercial.description')} {t('config.diagnostics.commercial.warning')}</SettingsHelp></span>
+
+              </div>
+              <Switch title={t('config.diagnostics.commercial.title')} checked={commercialModeDraft} aria-label={t('config.diagnostics.commercial.title')} disabled={controlsDisabled} onChange={(event) => {
+                    setCommercialModeDraft(event.currentTarget.checked);
+                    markLoggingDraftDirty();
+                  }} />
+            </div>
+
+            <div className="config-diagnostics-setting">
+              <span className="config-diagnostics-setting-icon" aria-hidden="true"><HardDrive size={18} /></span>
+              <div className="config-diagnostics-setting-copy">
+                <span className="config-field-label"><strong>{t('config.diagnostics.fileLogging.title')}</strong><SettingsHelp label={t('config.diagnostics.fileLogging.title')}>{t('config.diagnostics.fileLogging.description')}</SettingsHelp></span>
+
+              </div>
+              <Switch title={t('config.diagnostics.fileLogging.title')} checked={loggingToFileDraft} aria-label={t('config.diagnostics.fileLogging.title')} disabled={controlsDisabled} onChange={(event) => {
+                    setLoggingToFileDraft(event.currentTarget.checked);
+                    markLoggingDraftDirty();
+                  }} />
+            </div>
+
+            <div className="config-diagnostics-setting">
+              <span className="config-diagnostics-setting-icon" aria-hidden="true"><Database size={18} /></span>
+              <div className="config-diagnostics-setting-copy">
+                <span className="config-field-label"><strong>{t('config.diagnostics.usage.title')}</strong><SettingsHelp label={t('config.diagnostics.usage.title')}>{t('config.diagnostics.usage.description')}</SettingsHelp></span>
+
+              </div>
+              <Switch title={t('config.diagnostics.usage.title')} checked={usageStatisticsDraft} aria-label={t('config.diagnostics.usage.title')} disabled={controlsDisabled} onChange={(event) => {
+                    setUsageStatisticsDraft(event.currentTarget.checked);
+                    markLoggingDraftDirty();
+                  }} />
+            </div>
+          </div>
+
+          <div className="config-diagnostics-fields">
+            <div className="config-diagnostics-field">
+              <span className="config-field-label"><label htmlFor="config-input-config-diagnostics-maxSize-title">{t('config.diagnostics.maxSize.title')}</label><SettingsHelp label={t('config.diagnostics.maxSize.title')}>{t('config.diagnostics.maxSize.hint')}</SettingsHelp></span>
+              <input
+                  id="config-input-config-diagnostics-maxSize-title"
+                className="config-dialog-text-input"
+                type="number"
+                min="0"
+                step="1"
+                value={logsMaxTotalSizeDraft}
+                disabled={controlsDisabled}
+                onChange={(event) => {
+                  setLogsMaxTotalSizeDraft(event.currentTarget.value);
+                  markLoggingDraftDirty();
+                }}
+              />
+
+            </div>
+            <div className="config-diagnostics-field">
+              <span className="config-field-label"><label htmlFor="config-input-config-diagnostics-errorFiles-title">{t('config.diagnostics.errorFiles.title')}</label><SettingsHelp label={t('config.diagnostics.errorFiles.title')}>{t('config.diagnostics.errorFiles.hint')}</SettingsHelp></span>
+              <input
+                  id="config-input-config-diagnostics-errorFiles-title"
+                className="config-dialog-text-input"
+                type="number"
+                min="0"
+                step="1"
+                value={errorLogsMaxFilesDraft}
+                disabled={controlsDisabled}
+                onChange={(event) => {
+                  setErrorLogsMaxFilesDraft(event.currentTarget.value);
+                  markLoggingDraftDirty();
+                }}
+              />
+
+            </div>
+            <div className="config-diagnostics-field">
+              <span className="config-field-label"><label htmlFor="config-input-config-diagnostics-redisRetention-title">{t('config.diagnostics.redisRetention.title')}</label><SettingsHelp label={t('config.diagnostics.redisRetention.title')}>{t('config.diagnostics.redisRetention.hint')}</SettingsHelp></span>
+              <input
+                  id="config-input-config-diagnostics-redisRetention-title"
+                className="config-dialog-text-input"
+                type="number"
+                min="1"
+                max="3600"
+                step="1"
+                value={redisUsageRetentionDraft}
+                disabled={controlsDisabled}
+                onChange={(event) => {
+                  setRedisUsageRetentionDraft(event.currentTarget.value);
+                  markLoggingDraftDirty();
+                }}
+              />
+
+            </div>
+          </div>
+
+          {settings && commercialModeDraft !== settings.commercialMode ? (
+            <Notice tone="warn" icon={<AlertCircle size={16} />}>{st('restart')}</Notice>
+          ) : null}
+
+          <div className="config-diagnostics-footer">
+            <span className={`config-form-message ${loggingError ? 'error' : ''}`} role="alert">
+              {loggingError || ' '}
+            </span>
+            <div className="config-diagnostics-actions"><span className="config-card-status" role="status">{loggingSettingsDirty ? st('dirty') : ''}</span>
+              <button
+                type="button"
+                className="secondary-button compact-button"
+                disabled={controlsDisabled}
+                onClick={() => void handleOpenCoreLogsDirectory()}
+              >
+                <FolderOpen size={16} aria-hidden="true" />
+                {t('config.diagnostics.openLogs')}
+              </button>
+              <button
+                type="button"
+                className="primary-button compact-button"
+                disabled={controlsDisabled || !loggingSettingsDirty}
+                onClick={() => void saveCoreLoggingSettings()}
+              >
+                <Check size={16} aria-hidden="true" />
+                {loggingSettingsBusy ? t('common.saving') : t('common.save')}
+              </button>
+            </div>
+            {renderFeedback(loggingFeedback)}
+          </div>
+        </section>
+<section id="config-native-software" tabIndex={-1} hidden={searching || activeSubpage !== 'software'} className="panel surface-card config-software-panel">
             <div className="config-panel-heading">
               <div className="config-heading-title">
                 <Settings2 size={18} aria-hidden="true" />
@@ -2010,15 +1894,7 @@ export function ConfigPanelPage() {
                     {softwareStatusLabel}
                   </span>
                 ) : null}
-                <button
-                  type="button"
-                  className="primary-button compact-button"
-                  disabled={softwareSettingsLoading || softwareSettings === null || busyAction !== null || !softwareSettingsDirty}
-                  onClick={() => void saveSoftwareSettings()}
-                >
-                  <Check size={16} aria-hidden="true" />
-                  {busyAction === 'software' ? t('common.saving') : t('config.network.confirmSave')}
-                </button>
+
               </div>
             </div>
             <div className="config-software-content">
@@ -2031,23 +1907,12 @@ export function ConfigPanelPage() {
                     </span>
                     <div>
                       <strong>{t('config.software.autostart')}</strong>
-                      <small>{t('config.software.autostartDescription')}</small>
                     </div>
                   </div>
-                  <label className="switch-control" title={t('config.software.autostart')}>
-                    <input
-                      type="checkbox"
-                      role="switch"
-                      aria-label={t('config.software.autostart')}
-                      checked={softwareAutostartDraft}
-                      disabled={softwareSettingsLoading || softwareSettings === null || busyAction !== null}
-                      onChange={(event) => {
+                  <Switch title={t('config.software.autostart')} aria-label={t('config.software.autostart')} checked={softwareAutostartDraft} disabled={softwareSettingsLoading || softwareSettings === null || busyAction !== null} onChange={(event) => {
                         setSoftwareSavedStatusVisible(false);
                         setSoftwareAutostartDraft(event.currentTarget.checked);
-                      }}
-                    />
-                    <span className="switch-track" />
-                  </label>
+                      }} />
                 </div>
                 <div className="config-software-setting-row">
                   <div className="config-software-setting-copy">
@@ -2056,23 +1921,12 @@ export function ConfigPanelPage() {
                     </span>
                     <div>
                       <strong>{t('config.software.startCoreOnLaunch')}</strong>
-                      <small>{t('config.software.startCoreOnLaunchDescription')}</small>
                     </div>
                   </div>
-                  <label className="switch-control" title={t('config.software.startCoreOnLaunch')}>
-                    <input
-                      type="checkbox"
-                      role="switch"
-                      aria-label={t('config.software.startCoreOnLaunch')}
-                      checked={softwareStartCoreDraft}
-                      disabled={softwareSettingsLoading || softwareSettings === null || busyAction !== null}
-                      onChange={(event) => {
+                  <Switch title={t('config.software.startCoreOnLaunch')} aria-label={t('config.software.startCoreOnLaunch')} checked={softwareStartCoreDraft} disabled={softwareSettingsLoading || softwareSettings === null || busyAction !== null} onChange={(event) => {
                         setSoftwareSavedStatusVisible(false);
                         setSoftwareStartCoreDraft(event.currentTarget.checked);
-                      }}
-                    />
-                    <span className="switch-track" />
-                  </label>
+                      }} />
                 </div>
                 <div className="config-software-setting-row">
                   <div className="config-software-setting-copy">
@@ -2080,24 +1934,14 @@ export function ConfigPanelPage() {
                       <EyeOff size={18} />
                     </span>
                     <div>
-                      <strong>{t('config.software.silentStart')}</strong>
-                      <small>{t('config.software.silentStartDescription')}</small>
+                      <span className="config-field-label"><strong>{t('config.software.silentStart')}</strong><SettingsHelp label={t('config.software.silentStart')}>{t('config.software.silentStartDescription')}</SettingsHelp></span>
+
                     </div>
                   </div>
-                  <label className="switch-control" title={t('config.software.silentStart')}>
-                    <input
-                      type="checkbox"
-                      role="switch"
-                      aria-label={t('config.software.silentStart')}
-                      checked={softwareSilentStartDraft}
-                      disabled={softwareSettingsLoading || softwareSettings === null || busyAction !== null}
-                      onChange={(event) => {
+                  <Switch title={t('config.software.silentStart')} aria-label={t('config.software.silentStart')} checked={softwareSilentStartDraft} disabled={softwareSettingsLoading || softwareSettings === null || busyAction !== null} onChange={(event) => {
                         setSoftwareSavedStatusVisible(false);
                         setSoftwareSilentStartDraft(event.currentTarget.checked);
-                      }}
-                    />
-                    <span className="switch-track" />
-                  </label>
+                      }} />
                 </div>
                 <div className="config-software-setting-row config-software-close-row">
                   <div className="config-software-setting-copy">
@@ -2106,12 +1950,11 @@ export function ConfigPanelPage() {
                     </span>
                     <div>
                       <strong>{t('config.software.defaultTerminal')}</strong>
-                      <small>{t('config.software.defaultTerminalDescription')}</small>
                     </div>
                   </div>
                   <label className="config-software-select">
                     <span className="sr-only">{t('config.software.defaultTerminal')}</span>
-                    <select
+                    <Select
                       className="config-network-input"
                       value={softwareDefaultTerminalDraft}
                       disabled={softwareSettingsLoading || softwareSettings === null || busyAction !== null}
@@ -2125,7 +1968,7 @@ export function ConfigPanelPage() {
                           {terminal.id === 'auto' ? t('config.software.terminal.auto') : terminal.label}
                         </option>
                       ))}
-                    </select>
+                    </Select>
                   </label>
                 </div>
                 <div className="config-software-setting-row config-software-close-row">
@@ -2135,12 +1978,11 @@ export function ConfigPanelPage() {
                     </span>
                     <div>
                       <strong>{t('config.software.closeBehavior')}</strong>
-                      <small>{t('config.software.closeBehaviorDescription')}</small>
                     </div>
                   </div>
                   <label className="config-software-select">
                     <span className="sr-only">{t('config.software.closeBehavior')}</span>
-                    <select
+                    <Select
                       className="config-network-input"
                       value={softwareCloseBehaviorDraft}
                       disabled={softwareSettingsLoading || softwareSettings === null || busyAction !== null}
@@ -2152,189 +1994,170 @@ export function ConfigPanelPage() {
                       <option value="ask">{t('config.software.behavior.ask')}</option>
                       <option value="minimize-to-tray">{t('config.software.behavior.minimize')}</option>
                       <option value="exit">{t('config.software.behavior.exit')}</option>
-                    </select>
+                    </Select>
                   </label>
                 </div>
               </div>
             </div>
-          </section>
-        </div>
-      ) : activeSubpage === 'aliases' ? (
-        <div
-          className="config-subpage-panel"
-          id="config-subpage-panel"
-          role="tabpanel"
-          aria-labelledby="config-subpage-tab-aliases"
-        >
-          <ThinkingAliasesPage embedded />
-        </div>
-      ) : null}
 
-      {sensitiveWordsVisited ? (
-        <div
-          className="config-subpage-panel"
-          id={activeSubpage === 'sensitive-words' ? 'config-subpage-panel' : undefined}
-          role="tabpanel"
-          aria-labelledby="config-subpage-tab-sensitive-words"
-          aria-hidden={activeSubpage === 'sensitive-words' ? undefined : true}
-          style={{ display: activeSubpage === 'sensitive-words' ? undefined : 'none' }}
-        >
-          <SensitiveWordsPage />
+          <div className="config-settings-save-row"><button
+                  type="button"
+                  className="primary-button compact-button"
+                  disabled={softwareSettingsLoading || softwareSettings === null || busyAction !== null || !softwareSettingsDirty}
+                  onClick={() => void saveSoftwareSettings()}
+                >
+                  <Check size={16} aria-hidden="true" />
+                  {busyAction === 'software' ? t('common.saving') : t('common.save')}
+                </button></div>
+        </section>
+          </div>
+          <div id="config-template-panel" hidden={searching || templateGroups.length === 0}><TemplateConfigSection groups={allSettingsTemplateGroups} visibleGroups={templateGroups.map(group => group.id)} onDirtyGroupsChange={setDirtyTemplateGroups} /></div>
+          <div className="surface-card" id="config-native-aliases" tabIndex={-1} role="region" aria-label={t('app.nav.thinkingAliases')} hidden={searching || activeSubpage !== 'aliases'}>{aliasesVisited ? <ThinkingAliasesPage embedded /> : null}</div>
+          <div className="surface-card" id="config-native-sensitive-words" tabIndex={-1} role="region" aria-label={t('config.sensitiveWords.title')} hidden={searching || activeSubpage !== 'requests'}>{sensitiveWordsVisited ? <SensitiveWordsPage onDirtyChange={setSensitiveWordsDirty} /> : null}</div>
         </div>
-      ) : null}
+      </div>
 
       {addDialogOpen ? (
-        <div className="config-dialog-backdrop" onMouseDown={(event) => {
-          if (event.currentTarget === event.target) closeAddDialog();
-        }}>
-          <form
-            ref={addDialogRef}
-            className="config-dialog"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="add-api-key-title"
-            onSubmit={(event) => void submitApiKey(event)}
-          >
-            <div className="config-dialog-heading">
-              <div>
-                <KeyRound size={19} aria-hidden="true" />
-                <h2 id="add-api-key-title">
-                  {editingApiKey === null ? t('config.keys.addTitle') : t('config.keys.editTitle')}
-                </h2>
-              </div>
-              <button
-                type="button"
-                className="icon-button quiet"
-                onClick={closeAddDialog}
-                disabled={keyMutationBusy}
-                title={t('common.close')}
-                aria-label={t('common.close')}
-              >
-                <X size={18} aria-hidden="true" />
-              </button>
+        <Dialog
+          as="form"
+          labelledBy="add-api-key-title"
+          onSubmit={(event) => void submitApiKey(event)}
+          onClose={closeAddDialog}
+          closeDisabled={keyMutationBusy}
+          dismissOnBackdrop
+        >
+          <div className="config-dialog-heading">
+            <div>
+              <KeyRound size={19} aria-hidden="true" />
+              <h2 id="add-api-key-title">
+                {editingApiKey === null ? t('config.keys.addTitle') : t('config.keys.editTitle')}
+              </h2>
             </div>
+            <button
+              type="button"
+              className="icon-button quiet"
+              onClick={closeAddDialog}
+              disabled={keyMutationBusy}
+              title={t('common.close')}
+              aria-label={t('common.close')}
+            >
+              <X size={18} aria-hidden="true" />
+            </button>
+          </div>
 
-            <label className="config-dialog-field">
-              <span>{t('config.keys.label')}</span>
-              <div className="config-secret-input">
-                <input
-                  autoFocus
-                  type={showApiKey ? 'text' : 'password'}
-                  value={newApiKey}
-                  onChange={(event) => {
-                    setNewApiKey(event.currentTarget.value);
-                    setFormError('');
-                  }}
-                  disabled={keyMutationBusy}
-                  aria-invalid={Boolean(formError)}
-                  placeholder="sk-..."
-                />
-                <button
-                  type="button"
-                  className="icon-button quiet"
-                  onClick={() => setShowApiKey((visible) => !visible)}
-                  disabled={keyMutationBusy}
-                  title={showApiKey ? t('config.keys.hide') : t('config.keys.show')}
-                  aria-label={showApiKey ? t('config.keys.hide') : t('config.keys.show')}
-                >
-                  {showApiKey ? (
-                    <EyeOff size={17} aria-hidden="true" />
-                  ) : (
-                    <Eye size={17} aria-hidden="true" />
-                  )}
-                </button>
-              </div>
-            </label>
-
-            <label className="config-dialog-field">
-              <span>{t('config.keys.remark')}</span>
+          <label className="config-dialog-field">
+            <span>{t('config.keys.label')}</span>
+            <div className="config-secret-input">
               <input
-                className="config-dialog-text-input"
-                type="text"
-                value={newApiKeyRemark}
-                maxLength={80}
+                autoFocus
+                type={showApiKey ? 'text' : 'password'}
+                value={newApiKey}
                 onChange={(event) => {
-                  setNewApiKeyRemark(event.currentTarget.value);
+                  setNewApiKey(event.currentTarget.value);
                   setFormError('');
                 }}
                 disabled={keyMutationBusy}
-                placeholder={t('config.keys.remarkPlaceholder')}
+                aria-invalid={Boolean(formError)}
+                placeholder="sk-..."
               />
-            </label>
-
-            <div className={`config-form-message ${formError ? 'error' : ''}`}>
-              {formError || ' '}
-            </div>
-            {renderFeedback(keyFeedback)}
-
-            <div className="config-dialog-actions">
               <button
                 type="button"
-                className="secondary-button"
-                onClick={generateApiKey}
+                className="icon-button quiet"
+                onClick={() => setShowApiKey((visible) => !visible)}
                 disabled={keyMutationBusy}
+                title={showApiKey ? t('config.keys.hide') : t('config.keys.show')}
+                aria-label={showApiKey ? t('config.keys.hide') : t('config.keys.show')}
               >
-                {t('config.keys.generate')}
-              </button>
-              <button type="submit" className="primary-button" disabled={keyMutationBusy}>
-                {editingApiKey === null ? <Plus size={16} aria-hidden="true" /> : <Check size={16} aria-hidden="true" />}
-                {keyMutationBusy
-                  ? editingApiKey === null ? t('config.keys.adding') : t('common.saving')
-                  : editingApiKey === null ? t('common.add') : t('common.save')}
+                {showApiKey ? (
+                  <EyeOff size={17} aria-hidden="true" />
+                ) : (
+                  <Eye size={17} aria-hidden="true" />
+                )}
               </button>
             </div>
-          </form>
-        </div>
+          </label>
+
+          <label className="config-dialog-field">
+            <span>{t('config.keys.remark')}</span>
+            <input
+              className="config-dialog-text-input"
+              type="text"
+              value={newApiKeyRemark}
+              maxLength={80}
+              onChange={(event) => {
+                setNewApiKeyRemark(event.currentTarget.value);
+                setFormError('');
+              }}
+              disabled={keyMutationBusy}
+              placeholder={t('config.keys.remarkPlaceholder')}
+            />
+          </label>
+
+          <div className={`config-form-message ${formError ? 'error' : ''}`}>
+            {formError || ' '}
+          </div>
+          {renderFeedback(keyFeedback)}
+
+          <div className="config-dialog-actions">
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={generateApiKey}
+              disabled={keyMutationBusy}
+            >
+              {t('config.keys.generate')}
+            </button>
+            <button type="submit" className="primary-button" disabled={keyMutationBusy}>
+              {editingApiKey === null ? <Plus size={16} aria-hidden="true" /> : <Check size={16} aria-hidden="true" />}
+              {keyMutationBusy
+                ? editingApiKey === null ? t('config.keys.adding') : t('common.saving')
+                : editingApiKey === null ? t('common.add') : t('common.save')}
+            </button>
+          </div>
+        </Dialog>
       ) : null}
 
       {deleteIndex !== null ? (
-        <div className="config-dialog-backdrop" onMouseDown={(event) => {
-          if (event.currentTarget === event.target && busyAction !== 'delete-key') {
-            setDeleteIndex(null);
-          }
-        }}>
-          <div
-            ref={deleteDialogRef}
-            className={`config-dialog config-delete-dialog ${deletingLastKey ? 'has-warning' : ''}`}
-            role="alertdialog"
-            aria-modal="true"
-            aria-labelledby="delete-api-key-title"
-          >
-            <div className="config-dialog-heading">
-              <div>
-                <Trash2 size={19} aria-hidden="true" />
-                <h2 id="delete-api-key-title">{t('config.keys.deleteTitle')}</h2>
-              </div>
-            </div>
-            <code className="config-delete-key">{maskApiKey(selectedDeleteKey)}</code>
-            {renderFeedback(keyFeedback)}
-            {deletingLastKey ? (
-              <div className="config-delete-warning">
-                <AlertCircle size={17} aria-hidden="true" />
-                <span>{t('config.keys.deleteAllWarning')}</span>
-              </div>
-            ) : null}
-            <div className="config-dialog-actions two-actions">
-              <button
-                type="button"
-                className="secondary-button"
-                onClick={() => setDeleteIndex(null)}
-                disabled={busyAction === 'delete-key'}
-              >
-                {t('common.cancel')}
-              </button>
-              <button
-                type="button"
-                className="danger-button"
-                onClick={() => void confirmDelete()}
-                disabled={busyAction === 'delete-key'}
-              >
-                <Trash2 size={16} aria-hidden="true" />
-                {busyAction === 'delete-key' ? t('common.deleting') : t('common.delete')}
-              </button>
+        <Dialog
+          as="div"
+          alert
+          className={`config-dialog config-delete-dialog ${deletingLastKey ? 'has-warning' : ''}`}
+          labelledBy="delete-api-key-title"
+          onClose={() => setDeleteIndex(null)}
+          closeDisabled={busyAction === 'delete-key'}
+          dismissOnBackdrop
+        >
+          <div className="config-dialog-heading">
+            <div>
+              <Trash2 size={19} aria-hidden="true" />
+              <h2 id="delete-api-key-title">{t('config.keys.deleteTitle')}</h2>
             </div>
           </div>
-        </div>
+          <code className="config-delete-key">{maskApiKey(selectedDeleteKey)}</code>
+          {renderFeedback(keyFeedback)}
+          {deletingLastKey ? (
+            <Notice tone="error" icon={<AlertCircle size={17} />}>{t('config.keys.deleteAllWarning')}</Notice>
+          ) : null}
+          <div className="config-dialog-actions two-actions">
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => setDeleteIndex(null)}
+              disabled={busyAction === 'delete-key'}
+            >
+              {t('common.cancel')}
+            </button>
+            <button
+              type="button"
+              className="danger-button"
+              onClick={() => void confirmDelete()}
+              disabled={busyAction === 'delete-key'}
+            >
+              <Trash2 size={16} aria-hidden="true" />
+              {busyAction === 'delete-key' ? t('common.deleting') : t('common.delete')}
+            </button>
+          </div>
+        </Dialog>
       ) : null}
 
     </section>
@@ -2350,10 +2173,11 @@ function maskApiKey(apiKey: string) {
   return `${value.slice(0, visible)}${'*'.repeat(Math.max(6, 10 - visible * 2))}${value.slice(-visible)}`;
 }
 
-function routingStrategyLabel(strategy: string | undefined, t: ReturnType<typeof useI18n>['t']) {
+function routingStrategyLabel(strategy: string | undefined, t: ReturnType<typeof useI18n>['t'], locale: ReturnType<typeof useI18n>['locale']) {
   if (!strategy) {
     return t('common.loading');
   }
   const option = ROUTING_OPTIONS.find((item) => item.value === strategy);
+  if (strategy === 'weighted-round-robin') return templateText(templateMessages.weighted, locale);
   return option ? t(option.labelKey) : strategy;
 }

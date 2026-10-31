@@ -1,3 +1,4 @@
+import { invoke } from '@tauri-apps/api/core';
 import type { MessageKey } from '../i18n/resources';
 
 export const codexReasoningEfforts = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const;
@@ -11,6 +12,7 @@ export type CodexReasoningLevel = {
 export type CodexModelConfiguration = {
   display_name: string;
   description: string | null;
+  base_instructions: string;
   context_window: number;
   max_context_window: number;
   effective_context_window_percent: number;
@@ -20,6 +22,7 @@ export type CodexModelConfiguration = {
   input_modalities: Array<'text' | 'image'>;
   visibility: 'list' | 'hide' | 'none';
   supports_parallel_tool_calls: boolean;
+  supports_search_tool: boolean;
 };
 
 export type CodexCatalogEditorModel = {
@@ -32,6 +35,7 @@ export type CodexCatalogEditorModel = {
 };
 
 export type CodexCatalogEditorSnapshot = {
+  defaultAutoReviewModel?: string | null;
   revision: string;
   models: CodexCatalogEditorModel[];
 };
@@ -60,6 +64,7 @@ export function cloneCodexModelConfiguration(configuration: CodexModelConfigurat
 export function sameCodexModelConfiguration(left: CodexModelConfiguration, right: CodexModelConfiguration): boolean {
   return left.display_name === right.display_name
     && left.description === right.description
+    && left.base_instructions === right.base_instructions
     && Object.is(left.context_window, right.context_window)
     && Object.is(left.max_context_window, right.max_context_window)
     && Object.is(left.effective_context_window_percent, right.effective_context_window_percent)
@@ -67,6 +72,7 @@ export function sameCodexModelConfiguration(left: CodexModelConfiguration, right
     && left.default_reasoning_level === right.default_reasoning_level
     && left.visibility === right.visibility
     && left.supports_parallel_tool_calls === right.supports_parallel_tool_calls
+    && left.supports_search_tool === right.supports_search_tool
     && left.input_modalities.join(',') === right.input_modalities.join(',')
     && left.supported_reasoning_levels.length === right.supported_reasoning_levels.length
     && left.supported_reasoning_levels.every((level, index) => level.effort === right.supported_reasoning_levels[index].effort
@@ -95,6 +101,7 @@ export function toggleCodexReasoningLevel(
 }
 
 export function validateCodexModelConfiguration(configuration: CodexModelConfiguration): MessageKey | null {
+  if (!configuration.base_instructions.trim()) return 'agents.catalog.invalidPrompt';
   if (!configuration.display_name.trim() || configuration.display_name.length > 4_000
     || (configuration.description?.length ?? 0) > 4_000) return 'agents.catalog.invalidText';
   if (![configuration.context_window, configuration.max_context_window].every((value) => Number.isSafeInteger(value) && value > 0)) {
@@ -115,3 +122,9 @@ export function validateCodexModelConfiguration(configuration: CodexModelConfigu
   if (!configuration.input_modalities.length) return 'agents.catalog.invalidModalities';
   return null;
 }
+
+export const getCodexModelCatalogEditor = (): Promise<CodexCatalogEditorSnapshot> =>
+  invoke<CodexCatalogEditorSnapshot>('get_codex_model_catalog_editor');
+
+export const saveCodexModelCatalogEditor = (args: { request: { revision: string; review_model?: { model: string | null }; models: { slug: string; configuration: CodexModelConfiguration; }[]; }; }): Promise<CodexCatalogEditorSaveResult> =>
+  invoke<CodexCatalogEditorSaveResult>('save_codex_model_catalog_editor', args);

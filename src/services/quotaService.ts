@@ -1,3 +1,8 @@
+import { antigravityWindow, antigravityBucketLabel, antigravityGroupLabel, antigravityDescription } from './antigravityQuotaLabels';
+import { captureQuotaCacheGeneration } from './quotaCache';
+import { readClaudeResetGrants, type AnthropicResetGrantStatus } from './claudeResetGrants';
+import { selectResetGrant } from './selectClaudeResetGrant';
+import { resetGrantOperations, RETRY_WINDOW_MS } from './claudeResetOperations';
 import { buildXaiBillingSummary, mergeXaiBillingSummaries, type XaiBillingConfig } from './xaiBilling';
 import {
   apiCallErrorMessage,
@@ -7,9 +12,11 @@ import {
   readString,
 } from './managementApi';
 import { authFileName } from './authFiles';
+import { supportsPluginCredentialQuota, loadPluginCredentialQuota } from './pluginCredentialQuota';
 import { DEVIN_QUOTA_DATA, DEVIN_QUOTA_HEADERS, DEVIN_QUOTA_URL, readDevinQuota } from './devinQuota';
 import { antigravityProjectFor, codexMetadataFor, isPaidXaiFile } from './quotaMetadata';
 import { quotaResetFor, quotaResetInstant } from './quotaTime';
+import { parseKimiPlanName, parseKimiQuotaUrl } from './kimiQuota';
 import { getCurrentLocale, translate, type AppLocale } from '../i18n';
 
 const quotaText = (
@@ -23,6 +30,10 @@ export type QuotaStatus = 'idle' | 'loading' | 'success' | 'error';
 export type QuotaRow = {
   label: string;
   remainingPercent: number | null;
+  quotaAvailable?: boolean;
+  groupLabel?: string;
+  groupDescription?: string;
+  windowLabel?: string;
   reset?: string;
   resetAtMs?: number;
   detail?: string;
@@ -32,10 +43,14 @@ export type QuotaState = {
   rows: QuotaRow[];
   error?: string;
   plan?: string;
+  creditBalance?: string;
+  creditsUnlimited?: boolean;
+  claudeResetGrants?: AnthropicResetGrantStatus;
   resetCredits?: number;
   resetCreditsApplicable?: number;
   resetCreditsError?: string;
   resetCreditsEarliestExpiry?: string;
+  resetCreditExpiries?: string[];
   subscriptionActiveUntil?: string;
   serverTimeOffsetMs?: number;
   fetchedAt?: number;
@@ -86,7 +101,8 @@ const headersByProvider: Record<QuotaProvider, Record<string, string>> = {
   antigravity: {
     Authorization: 'Bearer $TOKEN$',
     'Content-Type': 'application/json',
-    'User-Agent': 'antigravity/cli/1.0.13 (aidev_client; os_type=darwin; arch=arm64)',
+    // Keep quota and loadCodeAssist requests aligned with Management Center's Hub client.
+    'User-Agent': 'antigravity/hub/2.23.0 darwin/arm64',
   },
 };
 
@@ -96,10 +112,15 @@ export const providerForFile = (file: AuthFile): QuotaProvider | null => {
   if (value === 'cognition') return 'devin';
   if (value === 'anthropic') return 'claude';
   if (value === 'anti-gravity') return 'antigravity';
+  if (value === 'kimi-ai') return 'kimi';
   return ['claude', 'codex', 'kimi', 'xai', 'antigravity', 'devin'].includes(value)
     ? (value as QuotaProvider)
     : null;
 };
+
+export type QuotaDisplayProvider = QuotaProvider | 'plugin';
+export const quotaProviderForFile = (file: AuthFile): QuotaDisplayProvider | null =>
+  providerForFile(file) ?? (supportsPluginCredentialQuota(file) ? 'plugin' : null);
 
 export const fileName = authFileName;
 
@@ -304,10 +325,28 @@ export const codexResetCreditsFor = (payload: unknown): number | undefined => {
   return count === null ? undefined : Math.max(0, Math.floor(count));
 };
 
+/** Read the account-level credits returned by the Codex usage endpoint. */
+export const codexAccountCreditsFor = (
+  payload: unknown,
+): { balance?: string; unlimited: boolean } => {
+  const value = parseBody(payload);
+  if (!isRecord(value) || !isRecord(value.credits)) return { unlimited: false };
+  const rawBalance = value.credits.balance;
+  const balance = typeof rawBalance === 'number'
+    ? String(rawBalance)
+    : typeof rawBalance === 'string' && rawBalance.trim() !== ''
+      ? rawBalance.trim()
+      : undefined;
+  return {
+    ...(balance && /^\d+(?:\.\d+)?$/.test(balance) && Number.isFinite(Number(balance)) ? { balance } : {}),
+    unlimited: value.credits.unlimited === true,
+  };
+};
+
 export const codexResetCreditDetailsFor = (
   payload: unknown,
   nowMs = Date.now(),
-): { availableCount?: number; applicableAvailableCount?: number; earliestExpiry?: string } => {
+): { availableCount?: number; applicableAvailableCount?: number; earliestExpiry?: string; expiries?: string[] } => {
   const value = parseBody(payload);
   if (!isRecord(value)) return {};
   const credits = Array.isArray(value.credits)
@@ -324,7 +363,7 @@ export const codexResetCreditDetailsFor = (
     const expiry = quotaResetInstant(credit.expires_at ?? credit.expiresAt);
     return expiry !== undefined && expiry > nowMs;
   });
-  const earliestExpiry = validCredits
+  const expiries = validCredits
     .map((credit) => readString(credit, 'expires_at', 'expiresAt'))
     .map((expiresAt) => ({ expiresAt, expiresAtMs: quotaResetInstant(expiresAt) ?? NaN }))
     .filter((credit) =>
@@ -332,14 +371,16 @@ export const codexResetCreditDetailsFor = (
       && Number.isFinite(credit.expiresAtMs)
       && credit.expiresAtMs > nowMs,
     )
-    .sort((left, right) => left.expiresAtMs - right.expiresAtMs)[0]?.expiresAt;
+    .sort((left, right) => left.expiresAtMs - right.expiresAtMs)
+    .map(credit => credit.expiresAt);
 
   return {
     availableCount: availableCount === null
       ? validCredits.length || undefined
       : Math.max(0, Math.floor(availableCount)),
     ...(applicableCount === null ? {} : { applicableAvailableCount: Math.max(0, Math.floor(applicableCount)) }),
-    earliestExpiry,
+    earliestExpiry: expiries[0],
+    expiries,
   };
 };
 
@@ -352,7 +393,32 @@ export const quotaRowsFor = (provider: QuotaProvider, payload: unknown): QuotaRo
   const value = parseBody(payload);
   if (!isRecord(value)) return [];
 
-  if (provider === 'codex') return codexWindowRows(value);
+  if (provider === 'codex') {
+    const rows = codexWindowRows(value);
+    const control = value.spend_control;
+    const individual = isRecord(control) ? control.individual_limit : undefined;
+    if (isRecord(individual)) {
+      const limit = numberValue(individual.limit);
+      const used = numberValue(individual.used);
+      const remaining = numberValue(individual.remaining);
+      const format = (amount: number) => new Intl.NumberFormat(getCurrentLocale(), {
+        maximumFractionDigits: 2,
+      }).format(amount);
+      rows.push({
+        label: quotaText('quota.service.individualSpendingLimit'),
+        remainingPercent: clampPercent(individual.remaining_percent)
+          ?? remainingFromUsedPercent(individual.used_percent)
+          ?? (remaining !== null && limit !== null && limit > 0
+            ? clampPercent(remaining / limit * 100) : null),
+        reset: codexResetLabel(individual),
+        resetAtMs: quotaResetFor(individual, ['reset_at'], ['reset_after_seconds']),
+        detail: used !== null && limit !== null
+          ? `${quotaText('quota.service.usedOf', { used: format(used), limit: format(limit) })} ${readString(individual, 'unit')}`.trim()
+          : undefined,
+      });
+    }
+    return rows;
+  }
 
   if (provider === 'claude') {
     const labels: Record<string, string> = {
@@ -422,7 +488,7 @@ export const quotaRowsFor = (provider: QuotaProvider, payload: unknown): QuotaRo
     if (isRecord(value.usage)) {
       items.push({ ...value.usage, label: readString(value.usage, 'name', 'title') || quotaText('quota.service.weekly') });
     }
-    return items
+    const rows = items
       .map((raw, index): QuotaRow | null => {
         if (!isRecord(raw)) return null;
         const detail = isRecord(raw.detail) ? raw.detail : raw;
@@ -475,6 +541,24 @@ export const quotaRowsFor = (provider: QuotaProvider, payload: unknown): QuotaRo
         };
       })
       .filter((row): row is QuotaRow => row !== null);
+    // Monthly usages are ratios, unlike the absolute counters in limits/usage.
+    const usages = isRecord(value.usages) ? value.usages : {};
+    for (const [key, labelKey] of [
+      ['limit_month_total', 'quota.service.kimi.monthlyTotal'],
+      ['limit_month_code', 'quota.service.kimi.monthlyCode'],
+    ] as const) {
+      const monthly = usages[key];
+      if (!isRecord(monthly)) continue;
+      const usedRatio = numberValue(monthly.used_ratio);
+      if (usedRatio === null) continue;
+      rows.push({
+        label: quotaText(labelKey),
+        remainingPercent: remainingFromUsedPercent(usedRatio * 100),
+        reset: absoluteResetLabel(monthly.reset_time),
+        resetAtMs: quotaResetFor(monthly, ['reset_time']),
+      });
+    }
+    return rows;
   }
 
   if (provider === 'xai') {
@@ -499,8 +583,8 @@ export const quotaRowsFor = (provider: QuotaProvider, payload: unknown): QuotaRo
       reset: absoluteResetLabel(billing.periodEnd),
       resetAtMs: billing.resetAtMs ?? undefined,
     };
-    if (billing.periodType === 'weekly'
-      && (billing.usagePercent !== null || billing.periodEnd || billing.productUsage.length > 0)) {
+    const hasWeeklyData = billing.periodType === 'weekly';
+    if (hasWeeklyData) {
       rows.push({
         label: quotaText('quota.service.weekly'),
         remainingPercent: remainingFromUsedPercent(billing.usagePercent),
@@ -527,13 +611,18 @@ export const quotaRowsFor = (provider: QuotaProvider, payload: unknown): QuotaRo
         detail: amount(billing.onDemandCapCents, billing.onDemandUsedCents),
       });
     }
-    if (billing.monthlyLimitCents !== null || billing.usedCents !== null || billing.billingPeriodEnd) {
+    if ((billing.monthlyLimitCents !== null || billing.usedCents !== null || billing.billingPeriodEnd)
+      && !(hasWeeklyData && billing.monthlyLimitCents === 0 && billing.usedCents === 0)) {
       rows.push({
         label: quotaText('quota.service.monthlyIncluded'),
         remainingPercent: remainingFromUsedPercent(billing.usedPercent),
         detail: amount(billing.monthlyLimitCents, billing.includedUsedCents),
         ...monthlyReset,
       });
+    }
+    if (billing.prepaidBalanceCents !== null && billing.prepaidBalanceCents > 0) {
+      rows.push({ label: quotaText('quota.service.prepaidBalance'), remainingPercent: null,
+        detail: formatUsdFromCents(billing.prepaidBalanceCents) });
     }
     return rows.length > 0 ? rows : [{
       label: quotaText(billing.periodType === 'weekly'
@@ -547,28 +636,38 @@ export const quotaRowsFor = (provider: QuotaProvider, payload: unknown): QuotaRo
   return groups.flatMap((group) => {
     if (!isRecord(group) || !Array.isArray(group.buckets)) return [];
     const order = (bucket: unknown) => {
-      const window = readString(bucket, 'window').toLowerCase();
+      const window = antigravityWindow(readString(bucket, 'display_name', 'displayName', 'description'), readString(bucket, 'window'));
       return ['5h', 'five-hour', 'five_hour'].includes(window) ? 0 : ['weekly', 'week'].includes(window) ? 1 : 2;
     };
     const buckets = [...group.buckets].sort((a, b) => order(a) - order(b));
-    const groupLabel = readString(group, 'display_name', 'displayName')
-      || quotaText('quota.service.quota');
-    const groupDescription = readString(group, 'description');
+    const rawGroupLabel = readString(group, 'display_name', 'displayName');
+    const groupLabel = antigravityGroupLabel(rawGroupLabel) || quotaText('quota.service.quota');
+    const groupDescription = antigravityDescription(rawGroupLabel, readString(group, 'description'));
+    const weeklyExhausted = buckets.some(bucket => isRecord(bucket)
+      && antigravityWindow(readString(bucket, 'display_name', 'displayName', 'description'), readString(bucket, 'window')) === 'weekly'
+      && quotaFraction(bucket.remaining_fraction ?? bucket.remainingFraction) === 0);
     return buckets
       .map((bucket, index): QuotaRow | null => {
         if (!isRecord(bucket)) return null;
         const remaining = quotaFraction(bucket.remaining_fraction ?? bucket.remainingFraction);
         if (remaining === null) return null;
-        const bucketLabel = readString(bucket, 'display_name', 'displayName', 'window');
+        const rawBucketLabel = readString(bucket, 'display_name', 'displayName', 'description');
+        const window = readString(bucket, 'window');
+        const bucketLabel = antigravityBucketLabel(rawBucketLabel, window);
         const label = bucketLabel && (buckets.length > 1 || bucketLabel !== groupLabel)
           ? `${groupLabel} · ${bucketLabel}`
           : groupLabel;
         return {
           label: label || quotaText('quota.service.quota.numbered', { index: index + 1 }),
+          groupLabel,
+          groupDescription,
+          windowLabel: bucketLabel,
           remainingPercent: remaining * 100,
+          quotaAvailable: remaining === 1
+            && !(antigravityWindow(rawBucketLabel, window) === '5h' && weeklyExhausted),
           reset: absoluteResetLabel(bucket.reset_time ?? bucket.resetTime),
           resetAtMs: quotaResetFor(bucket, ['reset_time', 'resetTime']),
-          detail: readString(bucket, 'description') || groupDescription || undefined,
+          detail: [groupDescription, antigravityDescription('', readString(bucket, 'description'))].filter(Boolean).join(' · ') || undefined,
         };
       })
       .filter((row): row is QuotaRow => row !== null);
@@ -579,7 +678,7 @@ const resolveProjectId = async (file: AuthFile): Promise<string> => {
   const direct = antigravityProjectFor(file);
   if (direct) return direct;
   try {
-    const payload = parseBody(await managementApi.get('/auth-files/download', { name: fileName(file) }));
+    const payload = parseBody(await managementApi.get('/credentials/download', { name: fileName(file) }));
     return isRecord(payload) ? antigravityProjectFor(payload) : '';
   } catch {
     return '';
@@ -615,7 +714,7 @@ const requestQuotaPayload = async (
   timeoutMs?: number,
   responseClock?: { serverTimeOffsetMs?: number },
 ) => {
-  const response = await managementApi.post<Record<string, unknown>>('/api-call', {
+  const response = await managementApi.post<Record<string, unknown>>('/requests/api-call', {
     authIndex,
     method,
     url,
@@ -679,6 +778,43 @@ const callXaiQuota = async (file: AuthFile): Promise<unknown> => {
   } catch {
     throw billingError;
   }
+};
+
+// Optional subscription requests run after the quota has been committed to the shared cache.
+export const enrichXaiQuotaPlan = async (file: AuthFile, quota: QuotaState): Promise<QuotaState> => {
+  if (providerForFile(file) !== 'xai' || quota.status !== 'success') return quota;
+  const authIndex = normalizeAuthIndex(file.auth_index ?? file.authIndex);
+  if (!authIndex) return quota;
+  const header = { ...headersByProvider.xai };
+  const userId = resolveXaiUserId(file);
+  if (userId) header['x-userid'] = userId;
+  const [user, settings] = await Promise.allSettled([
+    requestQuotaPayload(authIndex, 'https://cli-chat-proxy.grok.com/v1/user?include=subscription', header, 'GET', undefined, 8_000),
+    requestQuotaPayload(authIndex, 'https://cli-chat-proxy.grok.com/v1/settings', header, 'GET', undefined, 8_000),
+  ]);
+  const readPlan = (result: PromiseSettledResult<unknown>, keys: string[]) => {
+    if (result.status !== 'fulfilled' || !isRecord(result.value)) return '';
+    for (const key of keys) {
+      const value = result.value[key];
+      if (typeof value === 'string' && value.trim()) return value.trim();
+    }
+    return '';
+  };
+  const plan = readPlan(settings, ['subscription_tier_display', 'subscriptionTierDisplay'])
+    || readPlan(user, ['subscriptionTier', 'subscription_tier']);
+  return plan ? { ...quota, plan } : quota;
+};
+
+const xaiBillingPlan = (payload: unknown): string | undefined => {
+  if (!isRecord(payload)) return undefined;
+  const configs = [payload.monthly, payload.weekly, payload].filter(isRecord)
+    .map((record) => isRecord(record.config) ? record.config : record);
+  for (const config of configs) {
+    const limit = buildXaiBillingSummary(config as XaiBillingConfig)?.monthlyLimitCents;
+    if (limit === 150_000) return 'SuperGrok Heavy';
+    if (limit === 15_000) return 'SuperGrok';
+  }
+  return undefined;
 };
 
 const booleanValue = (value: unknown): boolean | null => {
@@ -836,7 +972,36 @@ const callCodexResetCredits = async (
   return codexResetCreditDetailsFor(payload);
 };
 
+async function callKimiQuota(file: AuthFile): Promise<{ payload: unknown; plan?: string }> {
+  const authIndex = normalizeAuthIndex(file.auth_index ?? file.authIndex);
+  if (!authIndex) throw new Error(quotaText('quota.service.error.missingAuthIndex'));
+  const generation = captureQuotaCacheGeneration();
+  const assertCurrent = () => {
+    if (captureQuotaCacheGeneration() !== generation) throw new Error(quotaText('quota.service.kimi.staleRequest'));
+  };
+  let url: string;
+  try {
+    if (!readString(file, 'name') || [file.runtimeOnly, file.runtime_only].some(value => value === true || value === 'true')) {
+      throw new Error('Credential unavailable');
+    }
+    url = parseKimiQuotaUrl(await managementApi.get('/credentials/download', { name: file.name as string }), file);
+  } catch {
+    throw new Error(quotaText('quota.service.kimi.domainUnavailable'));
+  }
+  assertCurrent();
+  const payload = await requestQuotaPayload(authIndex, url, headersByProvider.kimi);
+  assertCurrent();
+  let plan: string | undefined;
+  try {
+    plan = parseKimiPlanName(await requestQuotaPayload(authIndex, url.replace(/\/usages$/, '/me'),
+      { ...headersByProvider.kimi, Accept: 'application/json' }, 'GET', undefined, 8_000));
+  } catch { /* Optional profile failures must not hide valid quota data. */ }
+  assertCurrent();
+  return { payload, plan };
+}
+
 async function loadQuotaSnapshot(file: AuthFile): Promise<QuotaState> {
+  if (quotaProviderForFile(file) === 'plugin') return loadPluginCredentialQuota(file);
   const provider = providerForFile(file);
   if (!provider) {
     return {
@@ -850,14 +1015,15 @@ async function loadQuotaSnapshot(file: AuthFile): Promise<QuotaState> {
     const codexMetadata = provider === 'codex' ? codexMetadataFor(file) : undefined;
     const codexAccountId = codexMetadata?.accountId || '';
     const responseClock: { serverTimeOffsetMs?: number } = {};
-    const payloadPromise = provider === 'xai'
+    const kimi = provider === 'kimi' ? await callKimiQuota(file) : undefined;
+    const payloadPromise = kimi ? Promise.resolve(kimi.payload) : provider === 'xai'
       ? callXaiQuota(file)
       : callUpstreamQuota(file, provider, codexAccountId, responseClock);
     const planPromise = provider === 'claude'
       ? loadClaudePlan(file)
       : provider === 'antigravity'
         ? loadAntigravityPlan(file)
-        : Promise.resolve(undefined);
+        : Promise.resolve(kimi?.plan);
     let resetCreditsError: string | undefined;
     const resetCreditsPromise = provider === 'codex'
       ? callCodexResetCredits(file, codexAccountId).catch((error) => {
@@ -865,10 +1031,16 @@ async function loadQuotaSnapshot(file: AuthFile): Promise<QuotaState> {
         return null;
       })
       : Promise.resolve(null);
-    const [payload, detectedPlan, resetCreditDetails] = await Promise.all([
+    const claudeGrantsPromise = provider === 'claude'
+      ? readClaudeResetGrants(normalizeAuthIndex(file.auth_index ?? file.authIndex)).catch(() => {
+        resetCreditsError = quotaText('quota.claude.readError');
+        return undefined;
+      }) : Promise.resolve(undefined);
+    const [payload, detectedPlan, resetCreditDetails, claudeResetGrants] = await Promise.all([
       payloadPromise,
       planPromise,
       resetCreditsPromise,
+      claudeGrantsPromise,
     ]);
     const rows = quotaRowsFor(provider, payload);
     if (rows.length === 0) {
@@ -880,22 +1052,28 @@ async function loadQuotaSnapshot(file: AuthFile): Promise<QuotaState> {
     }
     const resetCredits = provider === 'codex'
       ? resetCreditDetails?.availableCount ?? codexResetCreditsFor(payload)
-      : undefined;
+      : claudeResetGrants?.grants.reduce((sum, grant) => sum + grant.resetsLeft, 0);
     const usageCreditDetails = provider === 'codex' && isRecord(payload)
       ? codexResetCreditDetailsFor(payload.rate_limit_reset_credits ?? payload.rateLimitResetCredits)
       : {};
+    const accountCredits = provider === 'codex' ? codexAccountCreditsFor(payload) : { unlimited: false };
     return {
       status: 'success',
       rows,
       plan: (provider === 'devin' ? readDevinQuota(payload).plan : detectedPlan)
+        ?? (provider === 'xai' ? xaiBillingPlan(payload) : undefined)
         ?? (readString(isRecord(payload) ? payload : {}, 'plan_type', 'planType') || codexMetadata?.plan),
+      creditBalance: accountCredits.balance,
+      creditsUnlimited: accountCredits.unlimited,
       subscriptionActiveUntil: provider === 'devin'
         ? readDevinQuota(payload).subscriptionActiveUntil : codexMetadata?.subscriptionActiveUntil,
+      claudeResetGrants,
       resetCreditsError,
-      resetCreditsApplicable: usageCreditDetails.applicableAvailableCount
+      resetCreditsApplicable: provider === 'claude' ? undefined : usageCreditDetails.applicableAvailableCount
         ?? resetCreditDetails?.applicableAvailableCount ?? resetCredits,
       resetCredits,
-      resetCreditsEarliestExpiry: resetCreditDetails?.earliestExpiry,
+      resetCreditExpiries: resetCreditDetails?.expiries ?? usageCreditDetails.expiries,
+      resetCreditsEarliestExpiry: resetCreditDetails?.earliestExpiry ?? claudeResetGrants?.grants.filter(grant => grant.resetsLeft > 0 && grant.endsAt).map(grant => grant.endsAt!).sort((a, b) => Date.parse(a) - Date.parse(b))[0],
       serverTimeOffsetMs: responseClock.serverTimeOffsetMs,
       fetchedAt: Date.now(),
     };
@@ -973,4 +1151,36 @@ function runQuotaMutation(file: AuthFile, mutate: () => Promise<QuotaState>): Pr
 
 export function consumeCodexResetCredit(file: AuthFile): Promise<QuotaState> {
   return runQuotaMutation(file, () => consumeCodexResetCreditSnapshot(file));
+}
+
+export function consumeClaudeResetCredit(file: AuthFile): Promise<QuotaState> {
+  const generation = captureQuotaCacheGeneration();
+  return runQuotaMutation(file, async () => {
+    if (captureQuotaCacheGeneration() !== generation) throw new Error(quotaText('quota.claude.blocked'));
+    if (providerForFile(file) !== 'claude' || booleanValue(file.disabled) === true)
+      throw new Error(quotaText('quota.claude.blocked'));
+    const authIndex = normalizeAuthIndex(file.auth_index ?? file.authIndex);
+    if (!authIndex) throw new Error(quotaText('quota.claude.blocked'));
+    const key = quotaKey(file);
+    const pending = resetGrantOperations.inspect(key);
+    const grantId = pending && !pending.code ? pending.grantId
+      : selectResetGrant(await readClaudeResetGrants(authIndex), Date.now())?.id;
+    if (!grantId || captureQuotaCacheGeneration() !== generation) throw new Error(quotaText('quota.claude.blocked'));
+    try {
+      const answer = await resetGrantOperations.run(key, authIndex, grantId);
+      if (answer.unresolved) throw new Error(quotaText('quota.claude.unknown'));
+      if (answer.code !== 'reset' && answer.code !== 'already_used')
+        throw new Error(quotaText(`quota.claude.${answer.code}`));
+    } catch (error) {
+      const operation = resetGrantOperations.inspect(key);
+      if (operation && !operation.code) throw new Error(quotaText(Date.now() - operation.createdAt >= RETRY_WINDOW_MS ? 'quota.claude.expired' : 'quota.claude.unknown'));
+      throw error;
+    }
+    return loadQuotaSnapshot(file);
+  });
+}
+
+export function quotaResetExpiries(quota: QuotaState): string[] {
+  return (quota.resetCreditExpiries ?? (quota.resetCreditsEarliestExpiry ? [quota.resetCreditsEarliestExpiry] : []))
+    .slice().sort((left, right) => (quotaResetInstant(left) ?? Infinity) - (quotaResetInstant(right) ?? Infinity));
 }

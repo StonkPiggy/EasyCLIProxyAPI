@@ -25,14 +25,6 @@ quota inspection, usage records, model aliases, and agent client configuration i
 The application is built with Tauri, React, and Rust. It can carry a matching CLIProxyAPI core
 archive, making first-time setup and offline installation easier.
 
-## Sponsor
-
-[![https://go.apimart.ai/gh-easycliproxyapi](./assets/apimart-en.png)](https://go.apimart.ai/gh-easycliproxyapi)
-
-Thanks to APIMart for sponsoring this project!
-
-APIMart is a low-cost API platform for AI image & video generation — GPT-Image-2 from $0.006/image, 160+ images per dollar. One async API covers both image and video: submit a task, get an ID, fetch results via polling or callback. Batch tens of thousands of images without timeouts, switch models without changing code. Pay-as-you-go with no monthly fee — [sign up here](https://go.apimart.ai/gh-easycliproxyapi) to get started.
-
 ## Feature Tour
 
 ### Home dashboard and local API endpoints
@@ -88,6 +80,17 @@ You can add multiple connections, search existing entries, refresh provider stat
 through the unified local CLIProxyAPI endpoint. Requests and responses can be converted between
 supported OpenAI, Claude, Gemini, and compatible formats.
 
+### Plugins
+
+The **Plugins** page manages installed core plugins, their enabled state and typed configuration.
+Browse the plugin store to install, update or select a release version, configure additional stores
+and environment-based authentication, open pages and sign in to accounts provided by enabled plugins. Pages provided by enabled plugins appear as a submenu under Plugins in the sidebar (below Versions), expanded when space allows and collapsible otherwise. A plugin page opens in a native webview that fills the content area, with small Back, Reload and Open in browser buttons in its bottom-right corner (drag the grip to move them; double-click it to reset); new-window links open in the system browser. Third-party
+installations require source review and a typed confirmation. The page detects unsupported core
+builds and shows a restart action when an installation or removal requires it.
+Refreshing **Local plugins** checks installed plugins for updates and shows an update action on their cards.
+Public GitHub releases are checked directly using the configured GitHub token or the app's `GITHUB_TOKEN` environment variable; auth-required entries keep the core's authentication flow.
+Refreshing the **Plugin store** only reloads the plugin list. Installation queries the latest release unless a version is selected.
+
 ### Usage history and token analytics
 
 ![Usage history and token analytics](docs/screenshots/en/4.png)
@@ -120,12 +123,19 @@ proxy. Supported clients include:
 - Antigravity CLI
 - Kimi Code
 - Grok Build
+- Oh My Pi
 
 For supported clients, the application can synchronize the available model catalog, select a
 default model, back up the original configuration before applying managed settings, and restore the
 previous configuration.
 
 Antigravity CLI connects through CPA's Gemini-compatible API. Launch the CLI from CPA to supply its endpoint and API key for that process. Running `agy` directly requires setting those environment variables yourself.
+
+Codex **Session Management → Edit Context (Experimental)** reads messages only after a session is selected.
+Listing and pagination query SQLite, the session index and directory metadata without opening or prefetching rollouts.
+Unindexed sessions are discovered by their standard rollout filenames; missing workspace and provider details load when the editor opens.
+Metadata is collapsed by default, with message-role filters retained. Close the target session before saving; saves modify real local history and create backups.
+Manually renamed files without a session ID in their filename or a database path are not discovered by scanning their contents.
 
 ## Additional Capabilities
 

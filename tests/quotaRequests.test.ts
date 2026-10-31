@@ -5,6 +5,7 @@ import { consumeCodexResetCredit, loadQuota } from '../src/services/quotaService
 const success = (body: unknown) => ({ status_code: 200, body });
 const codexUsage = {
   rate_limit: { primary_window: { used_percent: 25, limit_window_seconds: 18000 } },
+  credits: { balance: 12.5, unlimited: false },
   rate_limit_reset_credits: { available_count: 2, applicable_available_count: 0 },
 };
 const codexFile = { name: 'codex-test.json', provider: 'codex', auth_index: 1 };
@@ -19,7 +20,7 @@ beforeEach(() => {
   calls = [];
   handler = () => { throw new Error('Unexpected API request'); };
   post = spyOn(managementApi, 'post').mockImplementation(async (path, body) => {
-    expect(path).toBe('/api-call');
+    expect(path).toBe('/requests/api-call');
     const request = body as unknown as Request;
     calls.push(request);
     return await handler(request) as never;
@@ -39,7 +40,7 @@ describe('quota API compatibility', () => {
       ...codexFile,
       metadata: { id_token: { chatgpt_account_id: 'account-test', plan_type: 'pro', chatgpt_subscription_active_until: '2030-01-01T00:00:00Z' } },
     });
-    expect(result).toMatchObject({ status: 'success', plan: 'pro', resetCredits: 2, resetCreditsApplicable: 0, resetCreditsError: 'credits forbidden' });
+    expect(result).toMatchObject({ status: 'success', plan: 'pro', creditBalance: '12.5', creditsUnlimited: false, resetCredits: 2, resetCreditsApplicable: 0, resetCreditsError: 'HTTP 403: credits forbidden' });
     expect(result.subscriptionActiveUntil).toBe('2030-01-01T00:00:00Z');
     expect(calls).toHaveLength(2);
     for (const call of calls) {
@@ -100,6 +101,16 @@ describe('quota API compatibility', () => {
     const requests = calls.filter((request) => request.url.endsWith(':retrieveUserQuotaSummary'));
     expect(requests).toHaveLength(2);
     expect(requests[1].url).toContain('sandbox.googleapis.com');
+    expect(calls.filter((request) => request.url.endsWith(':loadCodeAssist'))).toHaveLength(1);
+    expect(calls).toHaveLength(3);
+    for (const request of calls) {
+      expect(request.method).toBe('POST');
+      expect(request.header).toMatchObject({
+        'User-Agent': 'antigravity/hub/2.23.0 darwin/arm64',
+        Authorization: 'Bearer $TOKEN$',
+        'Content-Type': 'application/json',
+      });
+    }
     requests.forEach((request) => expect(JSON.parse(request.data!)).toEqual({ project: 'project-test' }));
     expect(Math.abs((result.serverTimeOffsetMs ?? 0) - (Date.parse(serverTime) - Date.now()))).toBeLessThan(1000);
   });
@@ -110,7 +121,7 @@ describe('quota API compatibility', () => {
       groups: [{ buckets: [{ remainingFraction: 1 }] }],
     });
     expect((await loadQuota({ name: 'anti-download.json', provider: 'antigravity', auth_index: 'a' })).status).toBe('success');
-    expect(get).toHaveBeenCalledWith('/auth-files/download', { name: 'anti-download.json' });
+    expect(get).toHaveBeenCalledWith('/credentials/download', { name: 'anti-download.json' });
     expect(calls.find((request) => request.url.endsWith(':retrieveUserQuotaSummary'))?.data).toBe('{"project":"downloaded-project"}');
   });
 
@@ -167,7 +178,7 @@ describe('xAI quota queries aligned with Management Center', () => {
   it('账单和回退都失败时保留原始账单错误', async () => {
     handler = (request) => request.url.includes('cli-chat-proxy')
       ? { status_code: 403, body: 'billing denied' } : { status_code: 429, body: 'paid denied' };
-    expect(await loadQuota(file)).toMatchObject({ status: 'error', error: 'billing denied' });
+    expect(await loadQuota(file)).toMatchObject({ status: 'error', error: 'HTTP 403: billing denied' });
     expect(calls).toHaveLength(4);
   });
 
@@ -175,7 +186,7 @@ describe('xAI quota queries aligned with Management Center', () => {
     handler = (request) => request.url.endsWith('/me')
       ? success({}) : { status_code: 429, body: 'chat denied' };
     expect(await loadQuota({ ...file, using_api: true, prefix: 'paid' }))
-      .toMatchObject({ status: 'error', error: 'chat denied' });
+      .toMatchObject({ status: 'error', error: 'HTTP 429: chat denied' });
     expect(calls).toHaveLength(2);
   });
 
@@ -183,7 +194,7 @@ describe('xAI quota queries aligned with Management Center', () => {
     handler = (request) => success({ config: request.url.includes('format=credits')
       ? { currentPeriod: { type: 'weekly' } } : { creditUsagePercent: 0 } });
     expect(await loadQuota(file)).toMatchObject({
-      status: 'success', rows: [{ remainingPercent: 100 }],
+      status: 'success', rows: [{ remainingPercent: null }],
     });
     expect(calls).toHaveLength(2);
   });
@@ -268,7 +279,7 @@ describe('quota request synchronization', () => {
     const reset = consumeCodexResetCredit(codexFile);
     const refresh = loadQuota(codexFile);
     await expect(reset).rejects.toThrow('reset denied');
-    expect(await refresh).toMatchObject({ status: 'error', error: 'reset denied' });
+    expect(await refresh).toMatchObject({ status: 'error', error: 'HTTP 409: reset denied' });
     expect((await loadQuota(codexFile)).status).toBe('success');
   });
 });

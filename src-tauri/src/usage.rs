@@ -1,4 +1,5 @@
 mod resp;
+mod sources;
 mod token;
 
 #[cfg(target_os = "macos")]
@@ -21,7 +22,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{LazyLock, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -46,8 +47,16 @@ const USAGE_FAILURE_MIGRATION_KEY: &str = "failure_details_v4";
 const USAGE_EVENT_KEY_MIGRATION_KEY: &str = "event_key_v5";
 const USAGE_DATABASE_MAX_MB_KEY: &str = "max_database_size_mb";
 const USAGE_UPDATED_EVENT: &str = "usage-records-updated";
+
+fn emit_usage_updated(app: &tauri::AppHandle, collected_at: String) {
+    // #493: collection persists in Rust while hidden; do not keep feeding JS
+    // events into the suspended WebView. The UI fetches current data on resume.
+    if crate::window_activity::is_active(app) {
+        let _ = app.emit_to("main", USAGE_UPDATED_EVENT, collected_at);
+    }
+}
 const USAGE_SCHEMA_VERSION: u8 = 1;
-const USAGE_DATABASE_SCHEMA_VERSION: i64 = 5;
+const USAGE_DATABASE_SCHEMA_VERSION: i64 = 6;
 const MAX_USAGE_FAILURE_BODY_CHARS: usize = 2_000;
 const USAGE_QUEUE_BATCH_SIZE: usize = 10_000;
 const USAGE_INBOX_PROCESS_LIMIT: usize = 500;
@@ -224,6 +233,11 @@ pub(crate) struct UsageRecord {
     api_group_key: String,
     #[serde(default)]
     model: String,
+    #[serde(default, alias = "responseModel")]
+    response_model: String,
+    // Derived from the active price catalog when reading a page; never trust imported estimates.
+    #[serde(default, skip_deserializing)]
+    cost: Option<UsageRecordCost>,
     #[serde(default)]
     alias: String,
     #[serde(default, skip_serializing)]
@@ -262,6 +276,12 @@ pub(crate) struct UsageRecord {
     tokens: UsageTokenStats,
 }
 
+#[derive(Clone, Serialize)]
+struct UsageRecordCost {
+    total: f64,
+    pricing_model: String,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LegacyUsageHourFile {
@@ -288,6 +308,8 @@ pub(crate) struct UsageQuery {
     provider: Option<String>,
     #[serde(default)]
     source: Option<String>,
+    #[serde(default)]
+    upstream: Option<String>,
     #[serde(default)]
     api_key_hash: Option<String>,
     #[serde(default)]
@@ -472,7 +494,21 @@ pub(crate) struct UsageAnalysis {
     providers: Vec<UsageCategory>,
     sources: Vec<UsageCategory>,
     api_keys: Vec<UsageCategory>,
+    upstreams: Vec<UsageUpstream>,
 }
+
+#[derive(Serialize)]
+struct UsageUpstream {
+    #[serde(flatten)]
+    category: UsageCategory,
+    provider: String,
+    #[serde(rename = "isDefault")]
+    is_default: bool,
+}
+
+// Old records without an identity can only be grouped by route, never by a
+// raw source value that could contain an upstream or client secret.
+const USAGE_UPSTREAM_SQL: &str = "CASE WHEN TRIM(auth_index) != '' THEN 'auth:' || TRIM(auth_index) ELSE 'provider:' || TRIM(provider) END";
 
 #[derive(Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -661,7 +697,7 @@ pub(crate) async fn save_usage_storage_settings(
     app.state::<UsageCollectorState>()
         .set_total_records(settings.total_records);
     if settings.deleted_records > 0 {
-        let _ = app.emit(USAGE_UPDATED_EVENT, Local::now().to_rfc3339());
+        emit_usage_updated(&app, Local::now().to_rfc3339());
     }
     Ok(settings)
 }
@@ -681,7 +717,7 @@ pub(crate) async fn shrink_usage_database(
     app.state::<UsageCollectorState>()
         .set_total_records(settings.total_records);
     if settings.deleted_records > 0 {
-        let _ = app.emit(USAGE_UPDATED_EVENT, Local::now().to_rfc3339());
+        emit_usage_updated(&app, Local::now().to_rfc3339());
     }
     Ok(settings)
 }
@@ -1214,6 +1250,7 @@ fn initialize_usage_schema(connection: &Connection) -> Result<(), String> {
                 failure_body TEXT NOT NULL DEFAULT '',
                 provider TEXT NOT NULL DEFAULT '',
                 model TEXT NOT NULL DEFAULT '',
+                response_model TEXT NOT NULL DEFAULT '',
                 alias TEXT NOT NULL DEFAULT '',
                 reasoning_effort TEXT NOT NULL DEFAULT '',
                 service_tier TEXT NOT NULL DEFAULT '',
@@ -1303,6 +1340,7 @@ fn initialize_usage_schema(connection: &Connection) -> Result<(), String> {
         )
         .map_err(|error| format!("Failed to initialize SQLite usage records schema: {error}"))?;
     ensure_usage_failure_columns(connection)?;
+    ensure_usage_response_model_column(connection)?;
     connection
         .execute(
             "CREATE INDEX IF NOT EXISTS idx_usage_events_canceled_timestamp ON usage_events(canceled, timestamp_ms DESC)",
@@ -1312,6 +1350,20 @@ fn initialize_usage_schema(connection: &Connection) -> Result<(), String> {
     connection
         .pragma_update(None, "user_version", USAGE_DATABASE_SCHEMA_VERSION)
         .map_err(|error| format!("Failed to update SQLite usage records version: {error}"))
+}
+
+fn ensure_usage_response_model_column(connection: &Connection) -> Result<(), String> {
+    if !usage_table_columns(connection, "usage_events")?.contains("response_model") {
+        connection
+            .execute(
+                "ALTER TABLE usage_events ADD COLUMN response_model TEXT NOT NULL DEFAULT ''",
+                [],
+            )
+            .map_err(|error| {
+                format!("Failed to add SQLite usage record response_model field: {error}")
+            })?;
+    }
+    Ok(())
 }
 
 fn ensure_usage_failure_columns(connection: &Connection) -> Result<(), String> {
@@ -1854,7 +1906,7 @@ async fn usage_collector_loop(app: tauri::AppHandle, token: CancellationToken) {
                         &format!("Restored {saved} pending records"),
                         Some(collected_at.clone()),
                     );
-                    let _ = app.emit(USAGE_UPDATED_EVENT, collected_at);
+                    emit_usage_updated(&app, collected_at);
                     retry_seconds = 1;
                     continue;
                 }
@@ -2098,7 +2150,7 @@ fn publish_collected_records(app: &tauri::AppHandle, outcome: UsagePersistOutcom
         (saved > 0).then_some(collected_at.clone()),
     );
     if saved > 0 {
-        let _ = app.emit(USAGE_UPDATED_EVENT, collected_at);
+        emit_usage_updated(&app, collected_at);
     }
 }
 
@@ -2555,12 +2607,12 @@ fn insert_usage_records_in_transaction(
                 generate, cached_tokens, collector_source,
                 input_tokens, output_tokens, reasoning_tokens, cache_read_tokens,
                 cache_creation_tokens, total_tokens, canceled, failure_status,
-                failure_body, created_at
+                failure_body, created_at, response_model
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
                 ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
                 ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
-                ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40
+                ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41
             )
             "#,
         )
@@ -2631,6 +2683,7 @@ fn insert_usage_records_in_transaction(
                     i64::from(record.failure_status),
                     record.failure_body,
                     created_at,
+                    record.response_model,
                 ])
                 .map_err(|error| format!("Failed to write SQLite usage records: {error}"))?,
         );
@@ -2746,8 +2799,16 @@ fn normalize_usage_record(value: Value, config: &GuiConfigFile) -> Result<UsageR
         failure_body,
         provider,
         api_group_key,
-        model: string_field(object, "model").unwrap_or_else(|| "unknown".to_string()),
-        alias: string_field(object, "alias").unwrap_or_default(),
+        model: string_field(object, "resolved_model")
+            .or_else(|| string_field(object, "resolvedModel"))
+            .or_else(|| string_field(object, "model"))
+            .unwrap_or_else(|| "unknown".to_string()),
+        response_model: string_field(object, "response_model")
+            .or_else(|| string_field(object, "responseModel")).unwrap_or_default(),
+        cost: None,
+        alias: string_field(object, "alias")
+            .or_else(|| string_field(object, "requested_model"))
+            .or_else(|| string_field(object, "requestedModel")).unwrap_or_default(),
         client_ip: string_field(object, "client_ip"),
         x_forwarded_for: string_field(object, "x_forwarded_for"),
         user_agent: string_field(object, "user_agent"),
@@ -2836,6 +2897,20 @@ fn build_usage_filter(query: &UsageQuery) -> UsageSqlFilter {
         query.provider.as_deref(),
     );
     add_text_filter(&mut clauses, &mut params, "source", query.source.as_deref());
+    if let Some(upstream) = query.upstream.as_deref().filter(|value| !value.is_empty()) {
+        if let Some(group) = upstream.strip_prefix("group:") {
+            match serde_json::from_str::<Vec<String>>(group) {
+                Ok(keys) if !keys.is_empty() && keys.iter().all(|key| key.starts_with("auth:")) => {
+                    clauses.push(format!("({USAGE_UPSTREAM_SQL}) IN (SELECT value FROM json_each(?))"));
+                    params.push(SqlValue::Text(group.to_string()));
+                }
+                _ => clauses.push("0 = 1".to_string()),
+            }
+        } else {
+            clauses.push(format!("({USAGE_UPSTREAM_SQL}) = ?"));
+            params.push(SqlValue::Text(upstream.to_string()));
+        }
+    }
     add_text_filter(
         &mut clauses,
         &mut params,
@@ -2906,27 +2981,14 @@ fn load_usage_overview(
             COALESCE(SUM(cache_creation_tokens), 0),
             COALESCE(SUM(total_tokens), 0),
             COALESCE(SUM(latency_ms), 0),
-            COALESCE(
-                SUM(CASE
-                    WHEN generate != 0
-                     AND failed = 0
-                     AND canceled = 0
-                     AND output_tokens > 0
-                     AND latency_ms > 0
-                    THEN output_tokens
-                    ELSE 0
-                END) * 1000.0
-                / NULLIF(SUM(CASE
-                    WHEN generate != 0
-                     AND failed = 0
-                     AND canceled = 0
-                     AND output_tokens > 0
-                     AND latency_ms > 0
-                    THEN latency_ms
-                    ELSE 0
-                END), 0),
-                0.0
-            ),
+            COALESCE(AVG(CASE
+                WHEN generate != 0
+                 AND failed = 0
+                 AND canceled = 0
+                 AND output_tokens > 0
+                 AND latency_ms > 0
+                THEN output_tokens * 1000.0 / latency_ms
+            END), 0.0),
             COALESCE(SUM(CASE
                 WHEN generate != 0
                  AND failed = 0
@@ -3214,19 +3276,49 @@ fn cost_for_price(model: &str, service_tier: &str, tokens: &CostTokens, price: &
         long_output_multiplier,
     );
     let tier = service_tier.trim().to_ascii_lowercase();
-    let multiplier = if tokens.long_input > 0
-        && matches!(tier.as_str(), "priority" | "fast")
+    let multiplier = match tier.as_str() {
+        "flex" | "batch" => 0.5,
+        "priority" | "fast" => service_tier_multiplier(model),
+        _ => 1.0,
+    };
+    // A grouped total can contain both context lengths. Long-context overrides
+    // must not suppress the service-tier multiplier on its short requests.
+    let long_multiplier = if matches!(tier.as_str(), "priority" | "fast")
         && !is_model_family(model, "gpt-6")
     {
         1.0
     } else {
-        match tier.as_str() {
-            "flex" | "batch" => 0.5,
-            "priority" | "fast" => service_tier_multiplier(model),
-            _ => 1.0,
-        }
+        multiplier
     };
-    (short_cost + long_cost) * multiplier
+    short_cost * multiplier + long_cost * long_multiplier
+}
+
+fn usage_record_cost(record: &UsageRecord, prices: &HashMap<String, ModelPrice>) -> Option<UsageRecordCost> {
+    let (model, price) = resolve_model_price(&record.model, &record.alias, prices)?;
+    let input = record.tokens.input_tokens;
+    // Keep the same context buckets and tier selection as the aggregate pricing query.
+    let long = input > LONG_CONTEXT_INPUT_TOKEN_THRESHOLD
+        || (input > GROK_47_LONG_CONTEXT_INPUT_TOKEN_THRESHOLD && is_model_family(model, "grok-4.7"));
+    let tokens = CostTokens {
+        input,
+        output: record.tokens.output_tokens,
+        cache_read: record.tokens.cache_read_tokens,
+        cache_creation: record.tokens.cache_creation_tokens,
+        long_input: if long { input } else { 0 },
+        long_output: if long { record.tokens.output_tokens } else { 0 },
+        long_cache_read: if long { record.tokens.cache_read_tokens } else { 0 },
+        long_cache_creation: if long { record.tokens.cache_creation_tokens } else { 0 },
+    };
+    let identity = format!("{} {} {}", record.executor_type, record.provider, record.auth_type).to_ascii_lowercase();
+    let tier = if identity.contains("codex") || record.response_service_tier.trim().is_empty() {
+        &record.service_tier
+    } else {
+        &record.response_service_tier
+    };
+    Some(UsageRecordCost {
+        total: cost_for_price(model, tier, &tokens, &price),
+        pricing_model: price.model,
+    })
 }
 
 fn cost_for_token_segment(
@@ -3413,23 +3505,8 @@ fn find_model_price<'a>(
     prices: &'a HashMap<String, ModelPrice>,
     model: &str,
 ) -> Option<&'a ModelPrice> {
-    if let Some(price) = prices.get(model) {
+    if let Some(price) = find_exact_model_price(prices, model, |_| true) {
         return Some(price);
-    }
-    let case_insensitive = prices
-        .iter()
-        .filter(|(key, _)| key.eq_ignore_ascii_case(model))
-        .collect::<Vec<_>>();
-    if case_insensitive.len() == 1 {
-        return Some(case_insensitive[0].1);
-    }
-    let tail = canonical_model_tail(model);
-    let exact_tail = prices
-        .iter()
-        .filter(|(key, _)| canonical_model_tail(key) == tail)
-        .collect::<Vec<_>>();
-    if exact_tail.len() == 1 {
-        return Some(exact_tail[0].1);
     }
     let normalized_tail = normalized_model_tail(model);
     prices
@@ -3444,16 +3521,52 @@ fn find_model_price<'a>(
         .map(|(_, price)| price)
 }
 
+fn find_exact_model_price<'a>(
+    prices: &'a HashMap<String, ModelPrice>,
+    model: &str,
+    accepts: impl Fn(&ModelPrice) -> bool,
+) -> Option<&'a ModelPrice> {
+    let model = model.trim();
+    if model.is_empty() {
+        return None;
+    }
+    if let Some(price) = prices.get(model).filter(|price| accepts(price)) {
+        return Some(price);
+    }
+    let case_insensitive = prices
+        .iter()
+        .filter(|(key, price)| key.eq_ignore_ascii_case(model) && accepts(price))
+        .collect::<Vec<_>>();
+    if case_insensitive.len() == 1 {
+        return Some(case_insensitive[0].1);
+    }
+    let tail = canonical_model_tail(model);
+    let exact_tail = prices
+        .iter()
+        .filter(|(key, price)| canonical_model_tail(key) == tail && accepts(price))
+        .collect::<Vec<_>>();
+    if exact_tail.len() == 1 {
+        return Some(exact_tail[0].1);
+    }
+    None
+}
+
 fn resolve_model_price<'a>(
     model: &'a str,
     alias: &'a str,
     prices: &HashMap<String, ModelPrice>,
 ) -> Option<(&'a str, ModelPrice)> {
+    // Price the routed model first. Manual entries remain editable in the merged
+    // catalog, but must not hide an automatic price from the bundled catalog.
+    let automatic = find_exact_model_price(prices, model, |price| price.source != "manual")
+        .or_else(|| {
+            find_exact_model_price(cached_bundled_model_prices().ok()?, model, |_| true)
+        });
+    if let Some(price) = automatic {
+        return Some((model, price.clone()));
+    }
     for candidate in [model, alias] {
-        if candidate.trim().is_empty() {
-            continue;
-        }
-        if let Some(price) = find_model_price(prices, candidate) {
+        if let Some(price) = find_exact_model_price(prices, candidate, |price| price.source == "manual") {
             return Some((model, price.clone()));
         }
     }
@@ -3965,13 +4078,30 @@ pub(crate) async fn get_usage_analysis(
     gui_config_state: tauri::State<'_, GuiConfigState>,
 ) -> Result<UsageAnalysis, String> {
     let config = gui_config_state.snapshot()?;
-    run_usage_task(move || load_usage_analysis(&open_usage_database()?, &query, &config)).await
+    let metadata = sources::fetch(&config).await;
+    run_usage_task(move || {
+        let connection = open_usage_database()?;
+        let registry = sources::resolve(&connection, metadata)?;
+        let mut analysis = load_usage_analysis_with_notes(&connection, &query, &config, &HashMap::new())?;
+        sources::apply_analysis(&mut analysis, &registry);
+        Ok(analysis)
+    }).await
 }
 
+#[cfg(test)]
 fn load_usage_analysis(
     connection: &Connection,
     query: &UsageQuery,
     config: &GuiConfigFile,
+) -> Result<UsageAnalysis, String> {
+    load_usage_analysis_with_notes(connection, query, config, &HashMap::new())
+}
+
+fn load_usage_analysis_with_notes(
+    connection: &Connection,
+    query: &UsageQuery,
+    config: &GuiConfigFile,
+    notes: &HashMap<String, String>,
 ) -> Result<UsageAnalysis, String> {
     let filter = build_usage_filter(query);
     let sql = format!(
@@ -3984,9 +4114,9 @@ fn load_usage_analysis(
             MAX(TRIM(api_key_remark)), MAX(TRIM(api_key_display)),
             COUNT(*),
             COALESCE(SUM(CASE WHEN failed != 0 AND canceled = 0 THEN 1 ELSE 0 END), 0),
-            COALESCE(SUM(total_tokens), 0)
+            COALESCE(SUM(total_tokens), 0), TRIM(auth_index)
         FROM usage_events{}
-        GROUP BY 1, 2, 3, 4
+        GROUP BY 1, 2, 3, 4, 10
         "#,
         filter.clause
     );
@@ -3998,11 +4128,37 @@ fn load_usage_analysis(
         .map_err(|error| format!("Failed to query usage analytics: {error}"))?;
     let mut categories: [HashMap<String, UsageCategory>; 4] = Default::default();
     let mut key_labels = HashMap::<String, (String, String)>::new();
+    let mut source_labels = HashMap::<String, String>::new();
+    let mut source_notes = HashMap::<String, Option<String>>::new();
     let read_result = (|| -> rusqlite::Result<()> {
         while let Some(row) = rows.next()? {
             let requests = from_sql_i64(row.get(6)?);
             let failures = from_sql_i64(row.get(7)?);
             let tokens = from_sql_i64(row.get(8)?);
+            let provider: String = row.get(1)?;
+            let source: String = row.get(2)?;
+            let auth_index: String = row.get(9)?;
+            if let Some(note) = notes.get(&auth_index) {
+                // Historical indexes can disappear after reimporting a file.
+                // Only conflicting known notes make a source ambiguous.
+                source_notes.entry(source.clone())
+                    .and_modify(|current| {
+                        if current.as_ref() != Some(note) {
+                            *current = None;
+                        }
+                    })
+                    .or_insert_with(|| Some(note.clone()));
+            }
+            let label = usage_source_display(config, &provider, &source);
+            source_labels.entry(source.clone())
+                .and_modify(|current| {
+                    // A source may represent several credentials; avoid assigning
+                    // one credential's note to an ambiguous aggregate.
+                    if *current != label {
+                        *current = usage_source_display(config, "", &source);
+                    }
+                })
+                .or_insert(label);
             for (index, group) in categories.iter_mut().enumerate() {
                 let key: String = row.get(index)?;
                 if index == 3 {
@@ -4033,14 +4189,22 @@ fn load_usage_analysis(
     let sources = sources
         .into_iter()
         .map(|mut category| {
-            category.label = usage_source_display(config, "", &category.key);
+            if let Some(Some(note)) = source_notes.get(&category.key) {
+                category.label = note.clone();
+            } else if let Some(label) = source_labels.get(&category.key) {
+                category.label = label.clone();
+            }
             category
         })
         .collect();
+    let current_key_labels = usage_api_key_labels(config);
     let api_keys = api_keys
         .into_iter()
         .map(|mut category| {
-            let (remark, display) = key_labels.remove(&category.key).unwrap_or_default();
+            let (remark, display) = current_key_labels
+                .get(&category.key)
+                .cloned()
+                .unwrap_or_else(|| key_labels.remove(&category.key).unwrap_or_default());
             category.label = api_key_category_label(remark, display);
             category
         })
@@ -4050,7 +4214,39 @@ fn load_usage_analysis(
         providers,
         sources,
         api_keys,
+        upstreams: load_usage_upstreams(connection, query, config)?,
     })
+}
+
+// Keep source labels readable like keeper; identity remains in the filter value.
+fn usage_upstream_label(config: &GuiConfigFile, provider: &str, source: &str, _auth_index: &str) -> String {
+    if !source.trim().is_empty() && !config.api_keys.iter().any(|entry| entry.key == source.trim()) {
+        return usage_source_display(config, provider, source);
+    }
+    if provider.trim().is_empty() { "Unknown source".to_string() } else { provider.trim().to_string() }
+}
+
+fn load_usage_upstreams(connection: &Connection, query: &UsageQuery, config: &GuiConfigFile) -> Result<Vec<UsageUpstream>, String> {
+    let filter = build_usage_filter(query);
+    let sql = format!("SELECT {USAGE_UPSTREAM_SQL}, MAX(provider), MAX(source), MAX(TRIM(auth_index)), COUNT(*), SUM(CASE WHEN failed != 0 AND canceled = 0 THEN 1 ELSE 0 END), SUM(total_tokens) FROM usage_events{} GROUP BY 1 ORDER BY 7 DESC, 1", filter.clause);
+    let mut statement = connection.prepare(&sql).map_err(|error| format!("Failed to prepare upstream query: {error}"))?;
+    let rows = statement.query_map(params_from_iter(filter.params.iter()), |row| {
+        let provider: String = row.get(1)?;
+        let source: String = row.get(2)?;
+        let auth_index: String = row.get(3)?;
+        Ok(UsageUpstream {
+            category: UsageCategory {
+                key: row.get(0)?,
+                label: usage_upstream_label(config, &provider, &source, &auth_index),
+                requests: from_sql_i64(row.get(4)?),
+                failures: from_sql_i64(row.get(5)?),
+                tokens: from_sql_i64(row.get(6)?),
+            },
+            provider,
+            is_default: auth_index.trim().is_empty(),
+        })
+    }).map_err(|error| format!("Failed to query upstreams: {error}"))?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|error| format!("Failed to read upstreams: {error}"))
 }
 
 fn sorted_usage_categories(categories: HashMap<String, UsageCategory>) -> Vec<UsageCategory> {
@@ -4166,19 +4362,134 @@ fn load_api_key_categories(
     Ok(categories)
 }
 
+
+#[tauri::command]
+pub(crate) async fn save_usage_events_export(path: String, contents: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || write_usage_events_export(&path, &contents))
+        .await
+        .map_err(|error| format!("Failed to save usage export: {error}"))?
+}
+
+fn write_usage_events_export(path: &str, contents: &str) -> Result<(), String> {
+    let path = validated_usage_export_path(path)?;
+    fs::write(&path, contents.as_bytes())
+        .map_err(|error| format!("Failed to write usage export {}: {error}", path.display()))
+}
+
+fn validated_usage_export_path(path: &str) -> Result<PathBuf, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || trimmed.contains('\0') {
+        return Err("Usage export path is invalid".to_string());
+    }
+    let path = PathBuf::from(trimmed);
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err("Usage export path must be an absolute file path".to_string());
+    }
+    if path.file_name().is_none_or(|name| name.is_empty()) {
+        return Err("Usage export path must include a file name".to_string());
+    }
+    if path.is_dir() {
+        return Err("Usage export path is a directory".to_string());
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| "Usage export path has no directory".to_string())?;
+    if !parent.is_dir() {
+        return Err(format!(
+            "Usage export directory does not exist: {}",
+            parent.display()
+        ));
+    }
+    Ok(path)
+}
+
+#[cfg(test)]
+mod save_usage_events_export_tests {
+    use super::{validated_usage_export_path, write_usage_events_export};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "cpa-usage-export-{}-{}-{}",
+                std::process::id(),
+                label,
+                stamp
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn writes_the_selected_csv_and_replaces_an_existing_file() {
+        let directory = TempDir::new("write");
+        let path = directory.path().join("usage.csv");
+        fs::write(&path, "old").unwrap();
+        let selected = path.to_string_lossy().into_owned();
+        write_usage_events_export(&selected, "\u{feff}id\r\n1").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "\u{feff}id\r\n1");
+    }
+
+    #[test]
+    fn rejects_relative_paths_missing_directories_and_directories() {
+        let directory = TempDir::new("reject");
+        assert!(validated_usage_export_path("usage.csv").is_err());
+        assert!(validated_usage_export_path(&directory.path().to_string_lossy()).is_err());
+        let missing = directory
+            .path()
+            .join("missing")
+            .join("usage.csv")
+            .to_string_lossy()
+            .into_owned();
+        assert!(write_usage_events_export(&missing, "id").is_err());
+    }
+}
+
 #[tauri::command]
 pub(crate) async fn get_usage_events(
     query: UsageQuery,
     gui_config_state: tauri::State<'_, GuiConfigState>,
 ) -> Result<UsageEventPage, String> {
     let config = gui_config_state.snapshot()?;
-    run_usage_task(move || load_usage_events(&open_usage_database()?, &query, &config)).await
+    let metadata = sources::fetch(&config).await;
+    run_usage_task(move || {
+        let connection = open_usage_database()?;
+        let registry = sources::resolve(&connection, metadata)?;
+        let mut events = load_usage_events_with_notes(&connection, &query, &config, &HashMap::new())?;
+        sources::apply_events(&mut events, &registry, &config);
+        Ok(events)
+    }).await
 }
 
-fn load_usage_events(
+fn load_usage_events_with_notes(
     connection: &Connection,
     query: &UsageQuery,
     config: &GuiConfigFile,
+    _notes: &HashMap<String, String>,
 ) -> Result<UsageEventPage, String> {
     let filter = build_usage_filter(query);
     let total_sql = format!("SELECT COUNT(*) FROM usage_events{}", filter.clause);
@@ -4189,7 +4500,7 @@ fn load_usage_events(
         .map(from_sql_i64)
         .map_err(|error| format!("Failed to count SQLite usage events: {error}"))?
         .min(usize::MAX as u64) as usize;
-    let page_size = query.page_size.unwrap_or(50).clamp(20, 200);
+    let page_size = query.page_size.unwrap_or(50).clamp(1, 5_000);
     let total_pages = total.div_ceil(page_size).max(1);
     let page = query.page.unwrap_or(1).clamp(1, total_pages);
     let offset = (page - 1).saturating_mul(page_size);
@@ -4205,7 +4516,7 @@ fn load_usage_events(
             cached_tokens, collector_source,
             input_tokens, output_tokens, reasoning_tokens, cache_read_tokens,
             cache_creation_tokens, total_tokens, canceled, failure_status,
-            failure_body, id
+            failure_body, id, response_model
         FROM usage_events{}
         ORDER BY timestamp_ms DESC, id DESC
         LIMIT ? OFFSET ?
@@ -4223,8 +4534,22 @@ fn load_usage_events(
         .map_err(|error| format!("Failed to query SQLite usage events: {error}"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("Failed to read SQLite usage events: {error}"))?;
+    let prices = load_model_prices(connection)?;
+    let current_key_labels = usage_api_key_labels(config);
     for item in &mut items {
-        item.source_display = usage_source_display(config, &item.provider, &item.source);
+        if let Some((remark, display)) = current_key_labels.get(&item.api_key_hash) {
+            item.api_key_remark = remark.clone();
+            item.api_key_display = display.clone();
+        }
+        let source_is_client_key = hash_text(item.source.trim()) == item.api_key_hash
+            || config.api_keys.iter().any(|entry| entry.key == item.source.trim());
+        let identity = if item.auth_index.trim().is_empty() && !item.source.trim().is_empty() && !source_is_client_key {
+            usage_source_display(config, &item.provider, &item.source)
+        } else {
+            usage_upstream_label(config, &item.provider, if source_is_client_key { "" } else { &item.source }, &item.auth_index)
+        };
+        item.source_display = identity;
+        item.cost = usage_record_cost(item, &prices);
     }
     Ok(UsageEventPage {
         items,
@@ -4252,6 +4577,8 @@ fn usage_record_from_row(row: &Row<'_>) -> rusqlite::Result<UsageRecord> {
         provider: row.get(7)?,
         api_group_key: row.get(20)?,
         model: row.get(8)?,
+        response_model: row.get(37)?,
+        cost: None,
         alias: row.get(9)?,
         client_ip: row.get(21)?,
         x_forwarded_for: row.get(22)?,
@@ -4417,6 +4744,19 @@ fn mask_api_key(value: &str) -> String {
     format!("{start}••••{end}")
 }
 
+fn usage_api_key_labels(config: &GuiConfigFile) -> HashMap<String, (String, String)> {
+    config
+        .api_keys
+        .iter()
+        .map(|entry| {
+            (
+                hash_text(&entry.key),
+                (entry.remark.trim().to_string(), mask_api_key(&entry.key)),
+            )
+        })
+        .collect()
+}
+
 fn api_key_category_label(remark: String, display: String) -> String {
     if !remark.is_empty() {
         remark
@@ -4452,6 +4792,14 @@ fn usage_source_display(config: &GuiConfigFile, provider: &str, source: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn load_usage_events(
+        connection: &Connection,
+        query: &UsageQuery,
+        config: &GuiConfigFile,
+    ) -> Result<UsageEventPage, String> {
+        load_usage_events_with_notes(connection, query, config, &HashMap::new())
+    }
 
     #[tokio::test]
     async fn redis_usage_queue_falls_back_to_legacy_key_and_reuses_selection() {
@@ -5005,7 +5353,7 @@ mod tests {
         connection
     }
 
-    fn sample_record(id: &str, timestamp: &str, model: &str) -> UsageRecord {
+    pub(super) fn sample_record(id: &str, timestamp: &str, model: &str) -> UsageRecord {
         UsageRecord {
             id: id.to_string(),
             row_id: None,
@@ -5022,6 +5370,8 @@ mod tests {
             provider: "openai".to_string(),
             api_group_key: "hash".to_string(),
             model: model.to_string(),
+            response_model: String::new(),
+            cost: None,
             alias: String::new(),
             client_ip: None,
             x_forwarded_for: None,
@@ -5057,6 +5407,88 @@ mod tests {
     }
 
     #[test]
+    fn upstream_filter_uses_exact_identity_and_keeps_legacy_routes_separate() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialize_usage_schema(&connection).unwrap();
+        let config = GuiConfigFile::default();
+        let mut records = Vec::new();
+        for (index, (auth, provider)) in [("AccountA", "codex"), ("accounta", "codex"), ("", "claude"), ("", "gemini")].into_iter().enumerate() {
+            let mut record = sample_record(&format!("upstream-{index}"), "2026-10-11T00:00:00Z", "model");
+            record.auth_index = auth.to_string();
+            record.provider = provider.to_string();
+            record.source = "sk-shared-upstream-secret-for-test".to_string();
+            records.push(record);
+        }
+        insert_usage_records(&mut connection, &records).unwrap();
+        let all = load_usage_analysis(&connection, &UsageQuery::default(), &config).unwrap();
+        assert_eq!(all.upstreams.len(), 4);
+        for upstream in all.upstreams {
+            let query = UsageQuery { upstream: Some(upstream.category.key.clone()), ..Default::default() };
+            let page = load_usage_events(&connection, &query, &config).unwrap();
+            let overview = load_usage_overview(&connection, &query).unwrap();
+            assert_eq!(page.total, 1);
+            assert_eq!(overview.total_requests, 1);
+            if !page.items[0].auth_index.is_empty() {
+                assert_eq!(page.items[0].source_display, upstream.category.label);
+            }
+            assert!(!page.items[0].source_display.contains("secret"));
+            assert!(!upstream.category.key.contains("secret"));
+            assert!(!upstream.category.label.contains("secret"));
+        }
+        let missing = UsageQuery { upstream: Some("auth:unknown".to_string()), ..Default::default() };
+        assert_eq!(load_usage_events(&connection, &missing, &config).unwrap().total, 0);
+    }
+
+    #[test]
+    fn usage_key_labels_follow_current_remarks_without_changing_identity_or_totals() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialize_usage_schema(&connection).unwrap();
+        let key = "test-client-key-for-usage-labels";
+        let mut config = GuiConfigFile::default();
+        config.api_keys = vec![crate::GuiApiKeyEntry {
+            key: key.to_string(),
+            remark: "Codex".to_string(),
+        }];
+        let mut old = sample_record("old-label", "2026-10-10T00:00:00Z", "model");
+        old.api_key_hash = hash_text(key);
+        old.api_key_remark = "ZCODE".to_string();
+        let mut recent = old.clone();
+        recent.id = "new-label".to_string();
+        recent.request_id = "new-label".to_string();
+        recent.timestamp = "2026-10-11T00:00:00Z".to_string();
+        recent.api_key_remark = "Zcode".to_string();
+        insert_usage_records(&mut connection, &[old, recent]).unwrap();
+        let query = UsageQuery {
+            api_key_hash: Some(hash_text(key)),
+            ..Default::default()
+        };
+        for remark in ["Codex", "Renamed", ""] {
+            config.api_keys[0].remark = remark.to_string();
+            let analysis = load_usage_analysis(&connection, &query, &config).unwrap();
+            let events = load_usage_events(&connection, &query, &config).unwrap();
+            assert_eq!(analysis.api_keys.len(), 1);
+            let category = &analysis.api_keys[0];
+            assert_eq!(category.key, hash_text(key));
+            assert_eq!(category.requests, 2);
+            assert_eq!(
+                category.label,
+                if remark.is_empty() { mask_api_key(key) } else { remark.to_string() }
+            );
+            assert_eq!(events.total, 2);
+            assert!(events.items.iter().all(|item|
+                item.api_key_remark == remark && item.api_key_display == mask_api_key(key)
+            ));
+        }
+        // Deleted keys keep historical labels; reading does not rewrite stored records.
+        config.api_keys.clear();
+        let analysis = load_usage_analysis(&connection, &query, &config).unwrap();
+        assert_eq!(analysis.api_keys[0].label, "Zcode");
+        let events = load_usage_events(&connection, &query, &config).unwrap();
+        assert_eq!(events.items[0].api_key_remark, "Zcode");
+        assert_eq!(events.items[1].api_key_remark, "ZCODE");
+    }
+
+    #[test]
     fn api_key_category_uses_either_remark_or_masked_key() {
         assert_eq!(
             api_key_category_label("Production".to_string(), "12••••".to_string()),
@@ -5066,6 +5498,100 @@ mod tests {
             api_key_category_label(String::new(), "123456".to_string()),
             "12••••"
         );
+    }
+
+    #[test]
+    fn usage_source_notes_and_request_key_notes_stay_independent() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialize_usage_schema(&connection).unwrap();
+        let mut config = GuiConfigFile::default();
+        config.api_keys = vec![crate::GuiApiKeyEntry {
+            key: "client-key".into(), remark: "Client note".into(),
+        }];
+        for (section, remark) in [("xai-api-key", "Grok API note"), ("codex-api-key", "Other API note")] {
+            config.api_access_remarks.push(crate::GuiApiAccessRemark {
+                provider_section: section.into(), api_key_hash: hash_text("sk-upstream-test"),
+                record_hash: String::new(), remark: remark.into(),
+            });
+        }
+        let notes = HashMap::from([("grok-file".into(), "Grok credential note".into())]);
+        let mut oauth = sample_record("notes-oauth", "2026-08-27T00:00:00Z", "grok");
+        oauth.provider = "grok".into();
+        oauth.source = "account@example.com".into();
+        oauth.auth_index = "grok-file".into();
+        oauth.api_key_hash = hash_text("client-key");
+        let mut api = oauth.clone();
+        api.id = "notes-api".into();
+        api.source = "sk-upstream-test".into();
+        api.auth_index = "grok-api".into();
+        let mut historical = oauth.clone();
+        historical.id = "notes-historical".into();
+        historical.auth_index = "retired-grok-file".into();
+        insert_usage_records(&mut connection, &[oauth, api, historical]).unwrap();
+        let query = UsageQuery::default();
+        let analysis = load_usage_analysis_with_notes(&connection, &query, &config, &notes).unwrap();
+        assert_eq!(analysis.sources.iter().find(|c| c.key == "account@example.com").unwrap().label, "Grok credential note");
+        assert_eq!(analysis.sources.iter().find(|c| c.key == "sk-upstream-test").unwrap().label, "Grok API note");
+        assert_eq!(analysis.api_keys[0].label, "Client note");
+        assert_eq!(analysis.upstreams.iter().find(|c| c.category.key == "auth:grok-file").unwrap().category.label, "account@example.com");
+        let events = load_usage_events_with_notes(&connection, &query, &config, &notes).unwrap();
+        assert!(events.items.iter().all(|item| item.api_key_remark == "Client note"));
+        assert_eq!(events.items.iter().find(|item| item.auth_index == "grok-file").unwrap().source_display, "account@example.com");
+        let updated = HashMap::from([("grok-file".into(), "Updated note".into())]);
+        let analysis = load_usage_analysis_with_notes(&connection, &query, &config, &updated).unwrap();
+        assert_eq!(analysis.sources.iter().find(|c| c.key == "account@example.com").unwrap().label, "Updated note");
+        assert_eq!(analysis.upstreams.iter().find(|c| c.category.key == "auth:grok-file").unwrap().category.label, "account@example.com");
+        let conflicting = HashMap::from([
+            ("grok-file".into(), "First note".into()),
+            ("retired-grok-file".into(), "Different note".into()),
+        ]);
+        let analysis = load_usage_analysis_with_notes(&connection, &query, &config, &conflicting).unwrap();
+        assert_eq!(analysis.sources.iter().find(|c| c.key == "account@example.com").unwrap().label, "account@example.com");
+    }
+
+    #[test]
+    fn usage_accounts_survive_shared_notes_and_missing_auth_indexes() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialize_usage_schema(&connection).unwrap();
+        let config = GuiConfigFile::default();
+        let mut records = Vec::new();
+        for (id, account, auth) in [
+            ("first", "first@example.com", "auth-first"),
+            ("second", "second@example.com", "auth-second"),
+            ("legacy", "legacy@example.com", ""),
+        ] {
+            let mut record = sample_record(id, "2026-10-11T00:00:00Z", "model");
+            record.source = account.into();
+            record.auth_index = auth.into();
+            record.provider = "codex".into();
+            records.push(record);
+        }
+        insert_usage_records(&mut connection, &records).unwrap();
+        let notes = HashMap::from([
+            ("auth-first".into(), "Work".into()),
+            ("auth-second".into(), "Work".into()),
+        ]);
+        let query = UsageQuery::default();
+        let events = load_usage_events_with_notes(&connection, &query, &config, &notes).unwrap();
+        for event in &events.items {
+            assert!(event.source_display.contains(&event.source));
+            if !event.auth_index.is_empty() {
+                assert!(!event.source_display.contains("Work"));
+            }
+        }
+        let analysis = load_usage_analysis_with_notes(&connection, &query, &config, &notes).unwrap();
+        for event in events.items.iter().filter(|event| !event.auth_index.is_empty()) {
+            let key = format!("auth:{}", event.auth_index);
+            assert_eq!(analysis.upstreams.iter().find(|item| item.category.key == key).unwrap().category.label, event.source_display);
+        }
+        let mut fallback = sample_record("client-fallback", "2026-10-11T00:00:00Z", "model");
+        fallback.source = "retired-client-key".into();
+        fallback.api_key_hash = hash_text(&fallback.source);
+        fallback.auth_index.clear();
+        fallback.provider = "codex".into();
+        insert_usage_records(&mut connection, &[fallback]).unwrap();
+        let events = load_usage_events_with_notes(&connection, &query, &config, &notes).unwrap();
+        assert_eq!(events.items.iter().find(|event| event.source == "retired-client-key").unwrap().source_display, "codex");
     }
 
     #[test]
@@ -5132,7 +5658,11 @@ mod tests {
             default_terminal: crate::DEFAULT_AGENT_TERMINAL.to_string(),
             window_width: None,
             window_height: None,
+            window_x: None,
+            window_y: None,
             auth_dir: String::new(),
+            auth_dir_user_selected: false,
+            image_generation_user_selected: false,
             api_keys: Vec::new(),
             api_access_remarks: Vec::new(),
             management_secret_key: "123456".to_string(),
@@ -5142,6 +5672,7 @@ mod tests {
             logs_max_total_size_mb: crate::DEFAULT_LOGS_MAX_TOTAL_SIZE_MB,
             error_logs_max_files: crate::DEFAULT_ERROR_LOGS_MAX_FILES,
             usage_statistics_enabled: true,
+            usage_statistics_disabled: None,
             redis_usage_queue_retention_seconds: crate::DEFAULT_REDIS_USAGE_QUEUE_RETENTION_SECONDS,
             request_log: false,
             plugins_enabled: false,
@@ -5185,6 +5716,126 @@ mod tests {
         assert_eq!(record.tokens.total_tokens, 30);
         assert_eq!(record.tokens.cache_read_tokens, 5);
         assert!(!record.api_key_hash.is_empty());
+    }
+
+    #[test]
+    fn normalizes_response_model_when_present_and_defaults_when_missing() {
+        let config = GuiConfigFile::default();
+        for (response_model, expected) in [
+            (None, ""),
+            (Some(serde_json::json!(null)), ""),
+            (Some(serde_json::json!("  ")), ""),
+            (
+                Some(serde_json::json!(" gemini-3.8-flash ")),
+                "gemini-3.8-flash",
+            ),
+        ] {
+            let mut value = serde_json::json!({
+                "request_id": "response-model-normalization",
+                "model": "gemini-3.8-flash-high",
+                "alias": "client-alias"
+            });
+            if let Some(response_model) = response_model {
+                value["response_model"] = response_model;
+            }
+            let record = normalize_usage_record(value, &config).unwrap();
+
+            assert_eq!(record.response_model, expected);
+            assert_eq!(record.model, "gemini-3.8-flash-high");
+            assert_eq!(record.alias, "client-alias");
+            assert_eq!(
+                serde_json::to_value(&record).unwrap()["response_model"],
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn response_model_json_roundtrip_accepts_legacy_records_without_the_field() {
+        let mut record = sample_record("response-json", "2026-07-17T20:30:00+08:00", "gpt-a");
+        record.response_model = "gpt-upstream".to_string();
+        let mut encoded = serde_json::to_value(&record).unwrap();
+        let decoded: UsageRecord = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(decoded.response_model, "gpt-upstream");
+
+        encoded.as_object_mut().unwrap().remove("response_model");
+        let legacy: UsageRecord = serde_json::from_value(encoded).unwrap();
+        assert!(legacy.response_model.is_empty());
+        assert_eq!(legacy.model, "gpt-a");
+    }
+
+    #[test]
+    fn response_model_survives_sqlite_roundtrip() {
+        let root = test_root("response-model-roundtrip");
+        let mut connection = open_test_database(&root);
+        let mut record = sample_record(
+            "response-model-roundtrip",
+            "2026-07-17T20:30:00+08:00",
+            "gemini-alias",
+        );
+        record.response_model = "gemini-3.8-flash-high".to_string();
+        insert_usage_records(&mut connection, &[record]).unwrap();
+        let page = load_usage_events(
+            &connection,
+            &UsageQuery::default(),
+            &GuiConfigFile::default(),
+        )
+        .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].response_model, "gemini-3.8-flash-high");
+        assert_eq!(page.items[0].model, "gemini-alias");
+        assert_eq!(page.items[0].tokens.total_tokens, 30);
+        assert_eq!(
+            serde_json::to_value(&page.items[0]).unwrap()["response_model"],
+            "gemini-3.8-flash-high"
+        );
+        drop(connection);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn response_model_migration_preserves_v5_records_and_is_idempotent() {
+        let root = test_root("response-model-v6-migration");
+        let mut connection = open_test_database(&root);
+        let record = sample_record("legacy-v5", "2026-07-17T20:30:00+08:00", "gpt-a");
+        insert_usage_records(&mut connection, &[record]).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE usage_events DROP COLUMN response_model; PRAGMA user_version = 5;",
+            )
+            .unwrap();
+        assert!(!usage_table_columns(&connection, "usage_events")
+            .unwrap()
+            .contains("response_model"));
+        drop(connection);
+
+        initialize_usage_storage_at(&root).unwrap();
+        let mut connection = open_usage_database_at(&root).unwrap();
+        let config = GuiConfigFile::default();
+        let legacy_page = load_usage_events(&connection, &UsageQuery::default(), &config).unwrap();
+        assert_eq!(legacy_page.total, 1);
+        assert!(legacy_page.items[0].response_model.is_empty());
+        assert_eq!(legacy_page.items[0].tokens.total_tokens, 30);
+
+        let mut record = sample_record("new-v6", "2026-07-17T20:31:00+08:00", "gpt-b");
+        record.response_model = "gpt-upstream".to_string();
+        insert_usage_records(&mut connection, &[record]).unwrap();
+        drop(connection);
+
+        initialize_usage_storage_at(&root).unwrap();
+        let connection = open_usage_database_at(&root).unwrap();
+        let page = load_usage_events(&connection, &UsageQuery::default(), &config).unwrap();
+        assert_eq!(page.total, 2);
+        assert_eq!(page.items[0].response_model, "gpt-upstream");
+        assert!(page.items[1].response_model.is_empty());
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            USAGE_DATABASE_SCHEMA_VERSION
+        );
+        drop(connection);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -5808,6 +6459,9 @@ mod tests {
         let user_version = connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap();
+        let response_model_column = usage_table_columns(&connection, "usage_events")
+            .unwrap()
+            .contains("response_model");
         let migrated = connection
             .query_row(
                 r#"
@@ -5841,6 +6495,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(user_version, USAGE_DATABASE_SCHEMA_VERSION);
+        assert!(response_model_column);
         assert_eq!(migrated.0, 1);
         assert_eq!(migrated.1, 30);
         assert_eq!(migrated.2, "legacy-hash");
@@ -6253,8 +6908,15 @@ mod tests {
         let inbox_dir = root.join(LEGACY_USAGE_INBOX_DIR);
         fs::create_dir_all(&events_dir).unwrap();
         fs::create_dir_all(&inbox_dir).unwrap();
-        let first = sample_record("request-1", "2026-07-17T20:30:00+08:00", "gpt-a");
-        let second = sample_record("request-2", "2026-07-17T20:31:00+08:00", "gpt-b");
+        let mut first = serde_json::to_value(sample_record(
+            "request-1",
+            "2026-07-17T20:30:00+08:00",
+            "gpt-a",
+        ))
+        .unwrap();
+        first.as_object_mut().unwrap().remove("response_model");
+        let mut second = sample_record("request-2", "2026-07-17T20:31:00+08:00", "gpt-b");
+        second.response_model = "gpt-b-upstream".to_string();
         fs::write(
             events_dir.join("2026-07-17-20.json"),
             serde_json::to_vec(&serde_json::json!({
@@ -6294,6 +6956,14 @@ mod tests {
 
         assert_eq!(count, 2);
         assert_eq!(marker, "2");
+        let page = load_usage_events(
+            &connection,
+            &UsageQuery::default(),
+            &GuiConfigFile::default(),
+        )
+        .unwrap();
+        assert_eq!(page.items[0].response_model, "gpt-b-upstream");
+        assert!(page.items[1].response_model.is_empty());
         drop(connection);
         fs::remove_dir_all(root).unwrap();
     }
@@ -6332,6 +7002,13 @@ mod tests {
         assert_eq!(analysis.models[0].key, "gpt-5.6-terra");
         assert_eq!(events.total, 1);
         assert_eq!(events.items[0].id, "request-2");
+        let exported = load_usage_events(
+            &connection,
+            &UsageQuery { page_size: Some(5_000), ..query },
+            &config,
+        ).unwrap();
+        assert_eq!(exported.page_size, 5_000);
+        assert_eq!(exported.items.len(), 1);
         drop(connection);
         fs::remove_dir_all(root).unwrap();
     }
@@ -6357,7 +7034,7 @@ mod tests {
     }
 
     #[test]
-    fn overview_tps_uses_weighted_total_latency_without_requiring_ttft() {
+    fn overview_tps_averages_request_speeds_without_requiring_ttft() {
         let root = test_root("tps-overview");
         let mut connection = open_test_database(&root);
 
@@ -6418,10 +7095,64 @@ mod tests {
 
         let overview = load_usage_overview(&connection, &UsageQuery::default()).unwrap();
 
-        assert!((overview.tps - (300.0 * 1_000.0 / 4_000.0)).abs() < f64::EPSILON);
+        assert_eq!(overview.tps, (80.0 + 10.0 + 200.0 + 200.0) / 4.0);
         assert_eq!(overview.tps_sample_count, 4);
         drop(connection);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn response_model_accepts_manager_plus_field_names() {
+        let record = normalize_usage_record(serde_json::json!({
+            "request_id": "compatible-models", "requestedModel": "client-alias",
+            "resolvedModel": "gpt-6-sol", "model": "display-model",
+            "responseModel": " reported-model "
+        }), &GuiConfigFile::default()).unwrap();
+        assert_eq!(record.alias, "client-alias");
+        assert_eq!(record.model, "gpt-6-sol");
+        assert_eq!(record.response_model, "reported-model");
+    }
+
+    #[test]
+    fn request_cost_matches_aggregate_and_recalculates_current_prices() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialize_usage_schema(&connection).unwrap();
+        let mut records = Vec::new();
+        for (index, model) in ["gpt-6-sol", "gpt-5.6-terra", "xai/grok-4.7"].iter().enumerate() {
+            for input in [200_000, 250_000, 300_000] {
+                let mut record = sample_record(&format!("{index}-{input}"), "2026-10-04T00:00:00Z", model);
+                record.provider = if index < 2 { "codex" } else { "openai" }.into();
+                record.service_tier = "fast".into();
+                record.response_service_tier = "flex".into();
+                record.tokens.input_tokens = input;
+                record.tokens.output_tokens = 500;
+                record.tokens.reasoning_tokens = 100;
+                record.tokens.cache_read_tokens = 100_000;
+                record.tokens.cache_creation_tokens = 1_000;
+                record.tokens.total_tokens = input + 500;
+                record.response_model = "unpriced-response-must-not-change-billing".into();
+                records.push(record);
+            }
+        }
+        records.push(sample_record("unknown-price", "2026-10-04T00:00:00Z", "unpriced-model"));
+        insert_usage_records(&mut connection, &records).unwrap();
+        let query = UsageQuery::default();
+        let page = load_usage_events(&connection, &query, &GuiConfigFile::default()).unwrap();
+        let (aggregate, priced) = load_estimated_cost(&connection, &build_usage_filter(&query)).unwrap();
+        let total: f64 = page.items.iter().filter_map(|r| r.cost.as_ref().map(|c| c.total)).sum();
+        assert!((aggregate - total).abs() < 1e-9);
+        assert_eq!(priced, 9);
+        assert!(page.items.iter().find(|r| r.id == "unknown-price").unwrap().cost.is_none());
+
+        let free_price = ModelPrice { model: "unpriced-model".into(), prompt_configured: true,
+            completion_configured: true, cache_read_configured: true, cache_creation_configured: true,
+            source: "manual".into(), ..ModelPrice::default() };
+        upsert_model_price(&connection, &free_price).unwrap();
+        let updated = load_usage_events(&connection, &query, &GuiConfigFile::default()).unwrap();
+        let free = updated.items.iter().find(|r| r.id == "unknown-price").unwrap();
+        assert_eq!(free.cost.as_ref().unwrap().total, 0.0);
+        let imported: UsageRecord = serde_json::from_value(serde_json::to_value(free).unwrap()).unwrap();
+        assert!(imported.cost.is_none(), "Imported estimates must be recomputed");
     }
 
     #[test]
@@ -6693,6 +7424,60 @@ mod tests {
         .unwrap();
         assert_eq!(content, "{}");
         server.await.unwrap();
+    }
+
+    #[test]
+    fn pricing_uses_original_model_then_manual_fallback_without_prefix_guessing() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialize_usage_schema(&connection).unwrap();
+        for model in ["gpt-6-sol", "my-alias", "claude-sonnet-5-5"] {
+            upsert_model_price(&connection, &ModelPrice {
+                model: model.into(),
+                prompt: 99.0,
+                completion: 99.0,
+                prompt_configured: true,
+                completion_configured: true,
+                source: "manual".into(),
+                ..ModelPrice::default()
+            }).unwrap();
+        }
+        let prices = load_model_prices(&connection).unwrap();
+        let (_, original) = resolve_model_price("openai/GPT-6-SOL", "my-alias", &prices).unwrap();
+        assert_eq!(original.source, "builtin");
+        assert_eq!(original.prompt, 2.0);
+        let (_, manual) = resolve_model_price("unknown-model", "my-alias", &prices).unwrap();
+        assert_eq!(manual.source, "manual");
+        assert_eq!(manual.model, "my-alias");
+        let (_, manual_original) = resolve_model_price("claude-sonnet-5-5", "my-alias", &prices).unwrap();
+        assert_eq!(manual_original.model, "claude-sonnet-5-5");
+        assert_eq!(manual_original.prompt, 99.0);
+        assert!(resolve_model_price("unknown-model", "gpt-6-astra", &prices).is_none());
+        assert!(resolve_model_price("claude-sonnet-5-unknown", "", &prices).is_none());
+        assert!(resolve_model_price("unknown-model", "my-alias-extra", &prices).is_none());
+
+        let mut records = Vec::new();
+        for (id, model, alias) in [
+            ("original", "gpt-6-sol", "my-alias"),
+            ("manual", "unknown-model", "my-alias"),
+            ("unpriced", "unknown-model", "gpt-6-astra"),
+        ] {
+            let mut record = sample_record(id, "2026-10-04T00:00:00Z", model);
+            record.alias = alias.into();
+            records.push(record);
+        }
+        insert_usage_records(&mut connection, &records).unwrap();
+        let query = UsageQuery::default();
+        let page = load_usage_events(&connection, &query, &GuiConfigFile::default()).unwrap();
+        assert_eq!(page.items.iter().find(|r| r.id == "original").unwrap().cost.as_ref().unwrap().pricing_model, "gpt-6-sol");
+        assert_eq!(page.items.iter().find(|r| r.id == "manual").unwrap().cost.as_ref().unwrap().pricing_model, "my-alias");
+        assert!(page.items.iter().find(|r| r.id == "unpriced").unwrap().cost.is_none());
+        let total: f64 = page.items.iter().filter_map(|r| r.cost.as_ref().map(|c| c.total)).sum();
+        let overview = load_usage_overview(&connection, &query).unwrap();
+        let pricing = load_usage_pricing(&connection, &query).unwrap();
+        assert_eq!(overview.priced_requests, 2);
+        assert_eq!(pricing.priced_requests, 2);
+        assert!((overview.estimated_cost - total).abs() < 1e-9);
+        assert!((pricing.total_cost - total).abs() < 1e-9);
     }
 
     #[test]

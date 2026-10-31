@@ -11,6 +11,31 @@ struct TestCore {
     client: reqwest::Client,
 }
 
+#[tokio::test]
+#[ignore = "requires an explicitly prepared isolated CPA_DESKTOP_E2E_CONFIG; never use a production config"]
+async fn desktop_e2e_prepare_isolated_gateway_profile() {
+    let path = PathBuf::from(std::env::var_os("CPA_DESKTOP_E2E_CONFIG").expect("set isolated config path"));
+    let native: serde_json::Value = serde_norway::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let port = native["server"]["port"].as_u64().unwrap() as u16;
+    assert_ne!(port, 8317, "Never modify the production kernel");
+    assert_eq!(native["server"]["host"], "127.0.0.1");
+    let key = native["access"]["api-keys"][0].as_str().unwrap();
+    let gui = GuiConfigFile { port,
+        management_secret_key: "claude-e2e-local-management".into(),
+        api_keys: vec![GuiApiKeyEntry {key:key.into(),remark:String::new()}],
+        ..GuiConfigFile::default() };
+    let models = fetch_agent_models(port, key).await.unwrap();
+    let mappings = ClaudeDesktopModelMappings {
+        desktop_models: Some(vec![ClaudeDesktopModelMapping {
+            model:"grok-4.7-build-fast".into(), alias:"claude-sonnet-5-cc".into(), context_1m:true,
+        }]), ..ClaudeDesktopModelMappings::all("grok-4.7-build-fast") };
+    let profile = commit_agent_with_core(&gui, Some(mappings), &models, |mappings| {
+        build_claude_desktop_profile(None, &managed_core_loopback_origin(port), key,
+            "grok-4.7-build-fast", &models, mappings)
+    }).await.unwrap();
+    fs::write(path.parent().unwrap().join("desktop-profile.json"), profile).unwrap();
+}
+
 impl Drop for TestCore {
     fn drop(&mut self) {
         self.stop();
@@ -126,6 +151,190 @@ impl TestCore {
         }
         panic!("client key did not reach HTTP {expected}");
     }
+}
+
+#[tokio::test]
+#[ignore = "requires CPA_V8_TEST_CORE pointing to a v8 executable"]
+async fn v8_claude_desktop_and_code_share_persisted_model_routes() {
+    check_claude_model_routes(None).await;
+}
+
+#[tokio::test]
+#[ignore = "requires CPA_V8_TEST_CORE pointing to a v8 executable"]
+async fn v7_claude_routes_survive_v8_migration_and_reapply() {
+    for marker in ["", "config-version: 7\n"] {
+        check_claude_model_routes(Some(marker)).await;
+    }
+}
+
+async fn check_claude_model_routes(legacy_marker: Option<&str>) {
+    let executable = fs::canonicalize(std::env::var_os("CPA_V8_TEST_CORE").expect("set CPA_V8_TEST_CORE")).unwrap();
+    let directory = agent_test_home("v8-contract-claude-routes");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let mut core = TestCore {
+        child: None, config: directory.join("config.yaml"), directory, executable,
+        origin: format!("http://127.0.0.1:{port}"),
+        client: reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(3)).build().unwrap(),
+    };
+    let gui = GuiConfigFile {
+        port, management_secret_key: "isolated-test-secret".into(),
+        auth_dir: path_to_string(&core.directory.join("auth")),
+        api_keys: vec![GuiApiKeyEntry { key: "isolated-client-key".into(), remark: String::new() }],
+        ..GuiConfigFile::default()
+    };
+    let initial = "config-version: 8\nmanagement: {disable-control-panel: true, disable-auto-update-panel: true}\napi-keys:\n  codex:\n    - name: test-upstream\n      base-url: http://127.0.0.1:1/v1\n      models: [{name: model-one}]\n      keys: [{api-key: upstream-test, weight: 2}]\n";
+    let migrated;
+    let initial = if let Some(marker) = legacy_marker {
+        let legacy = format!("{marker}codex-api-key:\n  - api-key: upstream-test\n    base-url: http://127.0.0.1:1/v1\n    models: [{{name: model-one, alias: claude-sonnet-custom}}]\noauth-model-alias:\n  codex: [{{name: oauth-original, alias: claude-opus-legacy, fork: true}}]\npayload:\n  override:\n    - models: [{{name: claude-sonnet-custom, protocol: codex}}]\n      params: {{reasoning.effort: high, service_tier: priority}}\n");
+        migrated = migrate_legacy_core_config_to_v8("config-version: 8\nserver: {port: 8317}\nmanagement: {disable-control-panel: true, disable-auto-update-panel: true}\n", &legacy).unwrap();
+        let document: serde_norway::Value = serde_norway::from_str(&migrated).unwrap();
+        assert_eq!(document["config-version"].as_u64(), Some(8));
+        assert_eq!(document["oauth"]["model-alias"]["codex"][0]["alias"], "claude-opus-legacy");
+        assert_eq!(document["requests"]["payload"]["override"][0]["params"]["service_tier"], "priority");
+        for key in ["codex-api-key", "oauth-model-alias", "payload"] {
+            assert!(document.get(key).is_none(), "legacy field {key} must be migrated");
+        }
+        migrated.as_str()
+    } else { initial };
+    fs::write(&core.config, apply_gui_managed_settings(initial, &gui).unwrap()).unwrap();
+    core.start().await;
+    let before = core.config_view().await;
+    let desktop = fetch_prepared_agent_models(AgentClient::ClaudeDesktop, &gui).await.unwrap();
+    let mappings = ClaudeDesktopModelMappings {
+        desktop_models: Some(vec![ClaudeDesktopModelMapping {
+            model: if legacy_marker.is_some() { "claude-sonnet-custom" } else { "model-one" }.into(),
+            alias: if legacy_marker.is_some() { "" } else { "claude-sonnet-custom" }.into(), context_1m: false,
+        }]),
+        ..ClaudeDesktopModelMappings::all("model-one")
+    };
+    let profile = commit_agent_with_core(&gui, Some(mappings), &desktop.models, |mappings| {
+        build_claude_desktop_profile(None, &core.origin, "isolated-client-key", "model-one", &desktop.models, mappings)
+    }).await.unwrap();
+    let profile: serde_json::Value = serde_json::from_str(&profile).unwrap();
+    assert_eq!(profile["inferenceModels"][0]["name"], "claude-sonnet-custom");
+    assert_eq!(profile["inferenceGatewayBaseUrl"], core.origin);
+    let saved = core.config_view().await;
+    if legacy_marker.is_some() {
+        // Reapplying an existing public route must preserve its upstream,
+        // credentials, OAuth mappings, and reasoning/Fast overrides.
+        assert_eq!(saved["api-keys"], before["api-keys"]);
+        assert_eq!(saved["oauth"]["model-alias"], before["oauth"]["model-alias"]);
+        assert_eq!(saved["requests"]["payload"], before["requests"]["payload"]);
+    }
+    assert_eq!(saved["api-keys"]["codex"][0]["keys"], before["api-keys"]["codex"][0]["keys"]);
+    assert!(saved["api-keys"]["codex"][0]["models"].as_array().unwrap().iter()
+        .any(|entry| entry["name"] == "model-one" && entry["alias"] == "claude-sonnet-custom"));
+
+    for client in [AgentClient::ClaudeDesktop, AgentClient::ClaudeCode] {
+        let mut available = None;
+        for _ in 0..50 {
+            let prepared = fetch_prepared_agent_models(client, &gui).await.unwrap();
+            if prepared.models.iter().any(|model| model.name == "claude-sonnet-custom") {
+                available = Some(prepared.models);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let models = available.expect("Claude client must see the route published by the core");
+        if client == AgentClient::ClaudeCode {
+            let settings = build_claude_agent_config(None, &core.origin, "isolated-client-key", "claude-sonnet-custom", &models, None).unwrap();
+            let settings: serde_json::Value = serde_json::from_str(&settings).unwrap();
+            assert_eq!(settings["env"]["ANTHROPIC_MODEL"], "claude-sonnet-custom");
+            assert_eq!(settings["env"]["ANTHROPIC_BASE_URL"], core.origin);
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires CPA_V8_TEST_CORE pointing to a v8 executable"]
+async fn v8_model_write_migrates_legacy_provider_with_version_marker() {
+    let executable = fs::canonicalize(std::env::var_os("CPA_V8_TEST_CORE").expect("set CPA_V8_TEST_CORE")).unwrap();
+    let directory = agent_test_home("v8-contract-mixed-models");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let mut core = TestCore {
+        child: None, config: directory.join("config.yaml"), directory, executable,
+        origin: format!("http://127.0.0.1:{port}"),
+        client: reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(3)).build().unwrap(),
+    };
+    let gui = GuiConfigFile {
+        port, management_secret_key: "isolated-test-secret".into(),
+        ..GuiConfigFile::default()
+    };
+    let initial = format!("config-version: 8\nserver: {{host: 127.0.0.1, port: {port}}}\nmanagement: {{secret-key: isolated-test-secret, disable-control-panel: true, disable-auto-update-panel: true}}\noauth: {{auth-dir: '{}' }}\napi-keys: [isolated-client-key]\ncodex-api-key:\n  - api-key: upstream-test\n    base-url: http://127.0.0.1:1/v1\n    models: [{{name: model-one}}]\n", path_to_string(&core.directory.join("auth")));
+    fs::write(&core.config, initial).unwrap();
+    core.start().await;
+    let current = fetch_management_config_yaml(&gui).await.unwrap();
+    let mut updated: serde_norway::Value = serde_norway::from_str(&current).unwrap();
+    updated["codex-api-key"][0]["models"].as_sequence_mut().unwrap()
+        .push(serde_norway::from_str("{name: model-two}").unwrap());
+    put_management_alias_config_changes(&gui, &current, &serde_norway::to_string(&updated).unwrap()).await.unwrap();
+    let saved = core.config_view().await;
+    assert_eq!(saved["access"]["api-keys"], serde_json::json!(["isolated-client-key"]));
+    assert_eq!(saved["api-keys"]["codex"][0]["models"], serde_json::json!([{"name":"model-one"},{"name":"model-two"}]));
+    assert_eq!(saved["api-keys"]["codex"][0]["keys"][0]["api-key"], "upstream-test");
+}
+
+#[tokio::test]
+#[ignore = "requires CPA_V8_TEST_CORE pointing to a v8 executable"]
+async fn v8_alias_save_preserves_multi_key_groups_and_restores_inheritance_after_failure() {
+    let executable = fs::canonicalize(std::env::var_os("CPA_V8_TEST_CORE").expect("set CPA_V8_TEST_CORE")).unwrap();
+    let directory = agent_test_home("v8-contract-groups");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let mut core = TestCore {
+        child: None, config: directory.join("config.yaml"), directory, executable,
+        origin: format!("http://127.0.0.1:{port}"),
+        client: reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(3)).build().unwrap(),
+    };
+    let gui = GuiConfigFile {
+        host: "127.0.0.1".into(), port, auth_dir: path_to_string(&core.directory.join("auth")),
+        management_secret_key: "isolated-test-secret".into(),
+        api_keys: vec![GuiApiKeyEntry { key: "isolated-client-key".into(), remark: String::new() }],
+        ..GuiConfigFile::default()
+    };
+    let initial = r#"
+config-version: 8
+management: {disable-control-panel: true, disable-auto-update-panel: true}
+api-keys:
+  codex:
+    - name: shared-upstream
+      base-url: http://127.0.0.1:1/v1
+      models: [{name: gpt-test}]
+      keys:
+        - {api-key: test-first, weight: 2, priority: null}
+        - {api-key: test-second, weight: 5, models: null, headers: {}, excluded-models: [], disable-cooling: false}
+        - api-key: test-third
+          models: [{name: private-model}]
+"#;
+    fs::write(&core.config, apply_gui_managed_settings(initial, &gui).unwrap()).unwrap();
+    core.start().await;
+    core.validate_save(&fs::read_to_string(&core.config).unwrap()).await;
+    let original = core.config_view().await;
+    let current = fetch_management_config_yaml(&gui).await.unwrap();
+    let sources = resolved_thinking_alias_sources(&current, &[], &super::support::test_agent_models(&["gpt-test"])).unwrap();
+    let updated = add_model_alias_to_yaml(&current, &sources[0], "gpt-test-fast", "", false).unwrap();
+    let error = commit_management_alias_config_changes(&gui, &current, &updated, || Err::<(), _>("local save failed".into())).await.unwrap_err();
+    assert!(error.contains("Original configuration was restored"), "{error}");
+    assert_eq!(core.config_view().await["api-keys"], original["api-keys"]);
+
+    let current = fetch_management_config_yaml(&gui).await.unwrap();
+    let sources = resolved_thinking_alias_sources(&current, &[], &super::support::test_agent_models(&["gpt-test"])).unwrap();
+    let updated = add_model_alias_to_yaml(&current, &sources[0], "gpt-test-fast", "", false).unwrap();
+    put_management_alias_config_changes(&gui, &current, &updated).await.unwrap();
+    let saved = core.config_view().await;
+    let group = &saved["api-keys"]["codex"][0];
+    assert_eq!(saved["api-keys"]["codex"].as_array().unwrap().len(), 1);
+    assert_eq!(group["name"], "shared-upstream");
+    assert_eq!(group["keys"].as_array().unwrap().len(), 3);
+    assert_eq!(group["models"], original["api-keys"]["codex"][0]["models"]);
+    assert_eq!(group["keys"][0]["models"][1]["alias"], "gpt-test-fast");
+    assert_eq!(group["keys"][1], original["api-keys"]["codex"][0]["keys"][1]);
+    assert_eq!(group["keys"][2], original["api-keys"]["codex"][0]["keys"][2]);
 }
 
 #[tokio::test]
@@ -384,4 +593,56 @@ async fn v8_reloads_usage_after_repeated_gui_saves_in_both_config_layouts() {
         }
         upstream_task.await.unwrap();
     }
+}
+
+#[tokio::test]
+#[ignore = "requires CPA_V8_TEST_CORE and CPA_LOCAL_TEST_PLUGIN"]
+async fn local_plugin_copy_is_discovered_and_loads_in_real_kernel() {
+    let executable = fs::canonicalize(env::var_os("CPA_V8_TEST_CORE").expect("set CPA_V8_TEST_CORE")).unwrap();
+    let source = fs::canonicalize(env::var_os("CPA_LOCAL_TEST_PLUGIN").expect("set CPA_LOCAL_TEST_PLUGIN")).unwrap();
+    let directory = agent_test_home("v8-contract-local-plugin");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let mut core = TestCore {
+        child: None, config: directory.join("config.yaml"), directory, executable,
+        origin: format!("http://127.0.0.1:{port}"),
+        client: reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(3)).build().unwrap(),
+    };
+    let gui = GuiConfigFile {
+        port, plugins_enabled: true, management_secret_key: "isolated-test-secret".into(),
+        auth_dir: path_to_string(&core.directory.join("auth")),
+        api_keys: vec![GuiApiKeyEntry { key: "isolated-client-key".into(), remark: String::new() }],
+        ..GuiConfigFile::default()
+    };
+    let initial = "config-version: 8\nmanagement: {disable-control-panel: true, disable-auto-update-panel: true}\nplugins: {enabled: true, dir: plugins}\n";
+    fs::write(&core.config, merge_core_config_yaml(initial, None, &gui).unwrap()).unwrap();
+    core.start().await;
+    let list = |client: reqwest::Client, origin: String| async move {
+        client.get(format!("{origin}/v8/management/plugins")).bearer_auth("isolated-test-secret")
+            .send().await.unwrap().error_for_status().unwrap().json::<serde_json::Value>().await.unwrap()
+    };
+    let before = list(core.client.clone(), core.origin.clone()).await;
+    let returned_dir = PathBuf::from(before["plugins_dir"].as_str().unwrap());
+    let root = if returned_dir.is_absolute() { returned_dir } else { core.directory.join(returned_dir) };
+    let os = if cfg!(windows) { "windows" } else if cfg!(target_os="macos") { "darwin" } else { "linux" };
+    let arch = if cfg!(target_arch="aarch64") { "arm64" } else { "amd64" };
+    let extension = source.extension().unwrap().to_str().unwrap();
+    let installed = crate::plugins::local_install::copy_plugin(&source, &root.join(os).join(arch), extension).unwrap();
+    assert_eq!(fs::read(&installed).unwrap(), fs::read(&source).unwrap());
+    let after = list(core.client.clone(), core.origin.clone()).await;
+    let entry = after["plugins"].as_array().unwrap().iter().find(|entry| {
+        Path::new(entry["path"].as_str().unwrap_or("")).file_name() == source.file_name()
+    }).expect("copied plugin must be discovered");
+    let id = entry["id"].as_str().unwrap().to_string();
+    core.client.put(format!("{}/v8/management/config/plugins/configs/{id}/enabled", core.origin))
+        .bearer_auth("isolated-test-secret").json(&true)
+        .send().await.unwrap().error_for_status().unwrap();
+    core.stop();
+    core.start().await;
+    let loaded = list(core.client.clone(), core.origin.clone()).await;
+    let entry = loaded["plugins"].as_array().unwrap().iter().find(|entry| entry["id"] == id).unwrap();
+    assert_eq!(entry["registered"], true, "plugin must load: {entry}");
+    assert_eq!(entry["effective_enabled"], true, "plugin must be enabled: {entry}");
+    println!("Verified actual kernel discovery and loading: {id}");
 }

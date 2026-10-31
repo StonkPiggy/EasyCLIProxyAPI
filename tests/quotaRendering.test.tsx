@@ -2,7 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { I18nProvider } from '../src/i18n';
 import { QuotaCard } from '../src/pages/QuotaPage';
-import { quotaRowsFor } from '../src/services/quotaService';
+import { quotaRowsFor, formatQuotaTimestamp } from '../src/services/quotaService';
 import type { QuotaState } from '../src/services/quotaService';
 
 const render = (quota: QuotaState, provider = 'codex') => renderToStaticMarkup(
@@ -10,6 +10,14 @@ const render = (quota: QuotaState, provider = 'codex') => renderToStaticMarkup(
 );
 
 describe('quota card rendering', () => {
+  it('keeps invalid percentages unknown instead of drawing a malformed meter', () => {
+    for (const remainingPercent of [NaN, Infinity, -Infinity]) {
+      const html = render({ status: 'success', rows: [{ label: 'Window', remainingPercent }] });
+      expect(html).not.toContain('real-quota-track');
+      expect(html).not.toContain('NaN');
+      expect(html).not.toContain('Infinity');
+    }
+  });
   it('当前适用次数为零时仍可重置，并保留额度详情', () => {
     const html = render({
       status: 'success', rows: [], resetCredits: 2, resetCreditsApplicable: 0,
@@ -18,9 +26,10 @@ describe('quota card rendering', () => {
     expect(html).toMatch(/<button[^>]*title="Reset Quota"[^>]*>Reset Quota<\/button>/);
     expect(html).not.toMatch(/<button[^>]*disabled=""[^>]*>Reset Quota<\/button>/);
     expect(html).not.toContain('No applicable reset credits');
-    expect(html).toContain('Currently applicable: 0');
+    expect(html).not.toContain('Currently applicable: 0');
     expect(html).not.toContain('temporary failure');
-    expect(html).toContain('Subscription expires');
+    expect(html).toContain('Expires 01/01/2030, 00:00');
+    expect(html).not.toContain('Subscription expires:');
   });
 
   it.each(['error', 'refresh-error'] as const)('重置结果为 %s 时仍可再次点击重置', (status) => {
@@ -54,9 +63,27 @@ describe('quota card rendering', () => {
     expect(full).toContain('width:100%');
     expect(full).not.toContain('disabled=""');
   });
+  it('Grok 套餐、未知周额度和预付余额可通过现有卡片完整显示', () => {
+    const html = render({ status: 'success', plan: 'SuperGrok Heavy', rows: quotaRowsFor('xai', {
+      weekly: { config: { currentPeriod: { type: 'weekly', end: '2030-01-08T00:00:00Z' }, prepaidBalance: 250 } },
+      monthly: { config: { monthlyLimit: 10000, used: 2500 } },
+    }) }, 'xai');
+    expect(html).toContain('SuperGrok Heavy');
+    expect(html).toContain('Weekly quota');
+    expect(html).toContain('Prepaid balance');
+    expect(html).toContain('$2.50');
+    expect(html.match(/75% remaining/g)).toHaveLength(1);
+    expect(html.match(/real-quota-track/g)).toHaveLength(1);
+  });
   it('缓存中的原始重置时间提供动态提示，过期额度不伪造为已恢复', () => {
     const html = render({ status: 'success', rows: [{ label: '5h', remainingPercent: 0, resetAtMs: Date.parse('2020-01-01T00:00:00Z') }] });
     expect(html).toContain('Reset time reached; refresh to verify');
     expect(html).toContain('0% remaining');
+  });
+
+  it('Kimi 免费账号取不到额度时只显示卡片内失败状态', () => {
+    const html = render({ status: 'error', rows: [], error: 'free account cannot access quota' }, 'kimi');
+    expect(html).toContain('quota-card-error');
+    expect(html).not.toContain('app-notice-entry');
   });
 });

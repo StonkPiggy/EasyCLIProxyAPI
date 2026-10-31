@@ -12,15 +12,61 @@ use std::{
     fs,
     path::Path,
     process::{Command, Stdio},
-    sync::LazyLock,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        LazyLock, Mutex,
+    },
     time::Duration,
 };
+use tokio_util::sync::CancellationToken;
+
+static REQUESTS: LazyLock<Mutex<HashMap<String, CancellationToken>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
+
+// Reserve before sending so cancellation also works before the HTTP request starts.
+#[tauri::command]
+pub(crate) fn prepare_management_request() -> Result<String, String> {
+    let mut requests = REQUESTS
+        .lock()
+        .map_err(|_| "Request registry unavailable")?;
+    if requests.len() >= 256 {
+        return Err("Too many pending management requests".into());
+    }
+    let id = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed).to_string();
+    requests.insert(id.clone(), CancellationToken::new());
+    Ok(id)
+}
+
+#[tauri::command]
+pub(crate) fn cancel_management_request(request_id: String) -> Result<(), String> {
+    if let Some(token) = REQUESTS
+        .lock()
+        .map_err(|_| "Request registry unavailable")?
+        .remove(&request_id)
+    {
+        token.cancel();
+    }
+    Ok(())
+}
+
+struct RequestCleanup(String);
+impl Drop for RequestCleanup {
+    fn drop(&mut self) {
+        if let Ok(mut requests) = REQUESTS.lock() {
+            requests.remove(&self.0);
+        }
+    }
+}
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OAuthStartResult {
     url: String,
     state: Option<String>,
+    user_code: Option<String>,
+    flow: Option<String>,
+    expires_in: Option<u64>,
     opened: bool,
     open_error: Option<String>,
 }
@@ -36,6 +82,9 @@ pub(crate) struct OAuthStatusResult {
 struct OAuthStartApiResponse {
     url: Option<String>,
     state: Option<String>,
+    user_code: Option<String>,
+    flow: Option<String>,
+    expires_in: Option<u64>,
     error: Option<String>,
     #[serde(rename = "error_message")]
     error_message: Option<String>,
@@ -52,16 +101,62 @@ struct OAuthStatusApiResponse {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ManagementRequest {
+    request_id: Option<String>,
     method: String,
     path: String,
     query: Option<HashMap<String, String>>,
+    #[serde(default, deserialize_with = "deserialize_management_body")]
     body: Option<serde_json::Value>,
     #[serde(rename = "timeoutMs")]
     timeout_ms: Option<u64>,
 }
 
+fn deserialize_management_body<'de, D>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // An explicit v8 null is a JSON value, not an omitted request body.
+    serde_json::Value::deserialize(deserializer).map(Some)
+}
+
 #[tauri::command]
 pub(crate) async fn management_request(
+    gui_config_state: tauri::State<'_, GuiConfigState>,
+    request: ManagementRequest,
+) -> Result<serde_json::Value, String> {
+    let id = request.request_id.clone();
+    cancellable_management_request(id, management_request_inner(gui_config_state, request)).await
+}
+
+async fn cancellable_management_request(
+    request_id: Option<String>,
+    operation: impl std::future::Future<Output = Result<serde_json::Value, String>>,
+) -> Result<serde_json::Value, String> {
+    let cancellation = if let Some(id) = &request_id {
+        let token = REQUESTS
+            .lock()
+            .map_err(|_| "Request registry unavailable")?
+            .get(id)
+            .cloned()
+            .ok_or("Management API request cancelled")?;
+        Some((token, RequestCleanup(id.clone())))
+    } else {
+        None
+    };
+    if let Some((token, _cleanup)) = cancellation {
+        tokio::select! {
+            biased;
+            _ = token.cancelled() => Err("Management API request cancelled".into()),
+            result = operation => result,
+        }
+    } else {
+        operation.await
+    }
+}
+
+async fn management_request_inner(
     gui_config_state: tauri::State<'_, GuiConfigState>,
     request: ManagementRequest,
 ) -> Result<serde_json::Value, String> {
@@ -84,19 +179,66 @@ pub(crate) async fn management_request(
         .request(method, management_endpoint(&config, path)?)
         .header("Authorization", management_authorization(&config)?);
     if let Some(timeout_ms) = request.timeout_ms {
-        builder = builder.timeout(Duration::from_millis(timeout_ms.clamp(1_000, 120_000)));
+        let max_timeout = if path == "/credentials/refresh" { 300_000 } else { 120_000 };
+        builder = builder.timeout(Duration::from_millis(timeout_ms.clamp(1_000, max_timeout)));
     }
     if let Some(query) = request.query {
         builder = builder.query(&query);
     }
     if let Some(body) = request.body {
-        builder = builder.json(&body);
+        builder = management_request_body(builder, path, body)?;
     }
 
     let response = builder
         .send()
         .await
         .map_err(|err| format_management_request_error("Management API request failed", &err))?;
+    read_management_value(response).await
+}
+
+fn management_request_body(
+    builder: reqwest::RequestBuilder,
+    path: &str,
+    body: serde_json::Value,
+) -> Result<reqwest::RequestBuilder, String> {
+    if path.trim_start_matches('/') == "config.yaml" {
+        let yaml = body.as_str().ok_or("YAML configuration must be text")?;
+        Ok(builder
+            .header("Content-Type", "application/yaml")
+            .body(yaml.to_owned()))
+    } else {
+        Ok(builder.json(&body))
+    }
+}
+
+#[tauri::command]
+pub(crate) async fn import_vertex_credential(
+    gui_config_state: tauri::State<'_, GuiConfigState>,
+    name: String,
+    data: Vec<u8>,
+    location: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let name = name.trim();
+    if name.is_empty() || !name.to_ascii_lowercase().ends_with(".json") {
+        return Err("Credential filename must end with .json".to_string());
+    }
+    let config = gui_config_state.snapshot()?;
+    let part = reqwest::multipart::Part::bytes(data)
+        .file_name(name.to_owned())
+        .mime_str("application/json")
+        .map_err(|error| error.to_string())?;
+    let mut form = reqwest::multipart::Form::new().part("file", part);
+    if let Some(location) = location.filter(|value| !value.trim().is_empty()) {
+        form = form.text("location", location.trim().to_owned());
+    }
+    let response = management_http_client()?
+        .post(management_endpoint(&config, "oauth/import")?)
+        .header("Authorization", management_authorization(&config)?)
+        .query(&[("provider", "vertex")])
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|error| format_management_request_error("Failed to import Vertex credential", &error))?;
     read_management_value(response).await
 }
 
@@ -152,7 +294,7 @@ pub(crate) fn open_core_logs_directory(
     open_directory_in_file_manager(&logs_dir)
 }
 
-fn open_directory_in_file_manager(path: &Path) -> Result<(), String> {
+pub(crate) fn open_directory_in_file_manager(path: &Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     let mut command = Command::new(windows_explorer_executable());
     #[cfg(target_os = "macos")]
@@ -178,10 +320,11 @@ pub(crate) async fn start_oauth_login(
     gui_config_state: tauri::State<'_, GuiConfigState>,
     provider: String,
     browser: Option<String>,
+    plugin_provider: Option<bool>,
 ) -> Result<OAuthStartResult, String> {
     super::network_proxy::prepare_oauth(&app).await;
     let config = gui_config_state.snapshot()?;
-    let provider_key = normalize_management_oauth_provider(&provider)?;
+    let provider_key = normalize_oauth_request_provider(&provider, plugin_provider.unwrap_or(false))?;
     let client = management_http_client()?;
     let mut request = client
         .get(management_endpoint(&config, "oauth/auth-url")?)
@@ -195,6 +338,15 @@ pub(crate) async fn start_oauth_login(
         .await
         .map_err(|err| format_management_request_error("Failed to request OAuth login URL", &err))?;
     let payload = read_management_json::<OAuthStartApiResponse>(response).await?;
+    let mut result = normalize_oauth_start_response(payload)?;
+    match open_oauth_url_inner(&app, &result.url, browser.as_deref()) {
+        Ok(()) => result.opened = true,
+        Err(error) => result.open_error = Some(error),
+    }
+    Ok(result)
+}
+
+fn normalize_oauth_start_response(payload: OAuthStartApiResponse) -> Result<OAuthStartResult, String> {
     if let Some(error) = payload
         .error
         .or(payload.error_message)
@@ -212,16 +364,20 @@ pub(crate) async fn start_oauth_login(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
 
-    let (opened, open_error) = match open_oauth_url_inner(&app, &url, browser.as_deref()) {
-        Ok(()) => (true, None),
-        Err(error) => (false, Some(error)),
-    };
-
     Ok(OAuthStartResult {
         url,
         state,
-        opened,
-        open_error,
+        user_code: payload
+            .user_code
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        flow: payload
+            .flow
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty()),
+        expires_in: payload.expires_in.filter(|value| *value > 0),
+        opened: false,
+        open_error: None,
     })
 }
 
@@ -264,13 +420,14 @@ pub(crate) async fn submit_oauth_callback(
     gui_config_state: tauri::State<'_, GuiConfigState>,
     provider: String,
     redirect_url: String,
+    plugin_provider: Option<bool>,
 ) -> Result<(), String> {
     let redirect_url = redirect_url.trim().to_string();
     if redirect_url.is_empty() {
         return Err("Callback URL cannot be empty".to_string());
     }
     let config = gui_config_state.snapshot()?;
-    let provider_key = normalize_management_oauth_provider(&provider)?;
+    let provider_key = normalize_oauth_request_provider(&provider, plugin_provider.unwrap_or(false))?;
     let client = management_http_client()?;
     let body = serde_json::json!({
         "provider": provider_key,
@@ -334,12 +491,16 @@ pub(crate) fn format_management_request_error(
     }
 }
 
-pub(crate) fn management_authorization(config: &GuiConfigFile) -> Result<String, String> {
+pub(crate) fn management_plaintext_key(config: &GuiConfigFile) -> Result<&str, String> {
     let secret_key = config.management_secret_key.trim();
     if secret_key.is_empty() || is_hashed_management_secret_key(secret_key) {
         return Err("Management interface unavailable: no plaintext management key is available".to_string());
     }
-    Ok(format!("Bearer {secret_key}"))
+    Ok(secret_key)
+}
+
+pub(crate) fn management_authorization(config: &GuiConfigFile) -> Result<String, String> {
+    Ok(format!("Bearer {}", management_plaintext_key(config)?))
 }
 
 pub(crate) fn management_endpoint(config: &GuiConfigFile, path: &str) -> Result<String, String> {
@@ -355,12 +516,30 @@ pub(crate) fn management_endpoint(config: &GuiConfigFile, path: &str) -> Result<
     Ok(format!("{origin}/v8/management/{path}"))
 }
 
+fn normalize_oauth_request_provider(provider: &str, plugin_provider: bool) -> Result<String, String> {
+    if !plugin_provider {
+        return normalize_management_oauth_provider(provider);
+    }
+    // Plugin provider IDs are literal backend identifiers. A plugin named grok
+    // or cognition must not be redirected to the built-in xai or devin flow.
+    let key = provider.trim().to_ascii_lowercase();
+    if key.is_empty()
+        || !key
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err("Invalid OAuth provider".to_string());
+    }
+    Ok(key)
+}
+
 fn normalize_management_oauth_provider(provider: &str) -> Result<String, String> {
     let key = provider.trim().to_ascii_lowercase().replace('_', "-");
     let key = match key.as_str() {
         "claude" | "anthropic" => "claude".to_string(),
         "anti-gravity" => "antigravity".to_string(),
         "cognition" => "devin".to_string(),
+        "muse" => "meta".to_string(),
         "grok" | "x-ai" | "x.ai" => "xai".to_string(),
         other => other.to_string(),
     };
@@ -468,6 +647,156 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    #[tokio::test]
+    async fn cancellation_drops_stalled_requests_and_preserves_other_requests() {
+        let id = prepare_management_request().unwrap();
+        let other = prepare_management_request().unwrap();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (dropped, done) = tokio::sync::oneshot::channel();
+        struct DropNotice(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for DropNotice {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+            }
+        }
+        let task_id = id.clone();
+        let task = tokio::spawn(async move {
+            cancellable_management_request(Some(task_id), async move {
+                let _notice = DropNotice(Some(dropped));
+                let _ = started.send(());
+                std::future::pending().await
+            })
+            .await
+        });
+        ready.await.unwrap();
+        cancel_management_request(id.clone()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.unwrap_err(), "Management API request cancelled");
+        done.await.unwrap();
+        assert!(!REQUESTS.lock().unwrap().contains_key(&id));
+        assert!(REQUESTS.lock().unwrap().contains_key(&other));
+        // Normal errors also release reservations.
+        assert!(cancellable_management_request(Some(other.clone()), async {
+            Err("offline".into())
+        })
+        .await
+        .is_err());
+        assert!(!REQUESTS.lock().unwrap().contains_key(&other));
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_dispatch_never_polls_the_http_operation() {
+        let id = prepare_management_request().unwrap();
+        cancel_management_request(id.clone()).unwrap();
+        cancel_management_request(id.clone()).unwrap();
+        let result = cancellable_management_request(Some(id), async {
+            panic!("cancelled HTTP request must not be sent");
+        })
+        .await;
+        assert_eq!(result.unwrap_err(), "Management API request cancelled");
+    }
+
+    #[test]
+    fn v8_yaml_body_is_raw_text_and_config_values_remain_json() {
+        let client = reqwest::Client::new();
+        let yaml = "config-version: 8\naccess: {api-keys: [test-client]}\n";
+        let request = management_request_body(
+            client.put("http://127.0.0.1/v8/management/config.yaml"),
+            "/config.yaml",
+            serde_json::json!(yaml),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        assert_eq!(request.headers()["Content-Type"], "application/yaml");
+        assert_eq!(request.body().unwrap().as_bytes().unwrap(), yaml.as_bytes());
+
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!(false),
+            serde_json::json!(0),
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::json!("direct"),
+        ] {
+            let request = management_request_body(
+                client.put("http://127.0.0.1/v8/management/config/requests/proxy-url"),
+                "/config/requests/proxy-url",
+                value.clone(),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+            assert_eq!(request.headers()["Content-Type"], "application/json");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(request.body().unwrap().as_bytes().unwrap()).unwrap(),
+                value,
+            );
+        }
+        assert!(management_request_body(
+            client.put("http://127.0.0.1/v8/management/config.yaml"),
+            "/config.yaml",
+            serde_json::json!({}),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn v8_requests_distinguish_explicit_null_from_an_absent_body() {
+        let absent: ManagementRequest = serde_json::from_value(serde_json::json!({
+            "method": "GET", "path": "/config",
+        }))
+        .unwrap();
+        let explicit: ManagementRequest = serde_json::from_value(serde_json::json!({
+            "method": "PUT", "path": "/config/requests/payload", "body": null,
+        }))
+        .unwrap();
+        assert!(absent.body.is_none());
+        assert_eq!(explicit.body, Some(serde_json::Value::Null));
+    }
+
+    #[test]
+    fn plugin_oauth_preserves_literal_provider_ids_without_builtin_aliases() {
+        for provider in [
+            "grok",
+            "cognition",
+            "anti-gravity",
+            "anthropic",
+            "custom-sso",
+        ] {
+            assert_eq!(
+                normalize_oauth_request_provider(provider, true).unwrap(),
+                provider
+            );
+        }
+        assert_eq!(
+            normalize_oauth_request_provider(" Custom-SSO ", true).unwrap(),
+            "custom-sso"
+        );
+        for provider in ["", "custom_sso", "custom/sso", "custom.sso", "custom sso"] {
+            assert!(normalize_oauth_request_provider(provider, true).is_err());
+        }
+    }
+
+    #[test]
+    fn builtin_oauth_retains_aliases_when_plugin_provider_is_not_requested() {
+        for (provider, expected) in [
+            ("grok", "xai"),
+            ("cognition", "devin"),
+            ("anti-gravity", "antigravity"),
+            ("anthropic", "claude"),
+            ("custom_sso", "custom-sso"),
+        ] {
+            assert_eq!(
+                normalize_oauth_request_provider(provider, false).unwrap(),
+                expected
+            );
+        }
+    }
+
     #[test]
     fn management_errors_include_v8_validation_details() {
         assert_eq!(
@@ -500,6 +829,62 @@ mod tests {
             let key = normalize_management_oauth_provider(provider).unwrap();
             assert_eq!(key, "devin");
             assert!(management_oauth_uses_webui_callback(&key));
+        }
+    }
+
+    #[test]
+    fn meta_oauth_uses_the_device_flow() {
+        for provider in ["Meta", " muse "] {
+            let key = normalize_management_oauth_provider(provider).unwrap();
+            assert_eq!(key, "meta");
+            assert!(!management_oauth_uses_webui_callback(&key));
+        }
+    }
+
+    #[test]
+    fn oauth_start_preserves_device_authorization_fields_for_the_frontend() {
+        let payload = serde_json::from_value::<OAuthStartApiResponse>(serde_json::json!({
+            "status": "ok",
+            "url": " https://auth.meta.com/device ",
+            "state": " meta-device-state ",
+            "user_code": " ABCD-EFGH ",
+            "flow": "device",
+            "expires_in": 900,
+        }))
+        .unwrap();
+        let result = normalize_oauth_start_response(payload).unwrap();
+        let value = serde_json::to_value(result).unwrap();
+
+        assert_eq!(value["url"], "https://auth.meta.com/device");
+        assert_eq!(value["state"], "meta-device-state");
+        assert_eq!(value["userCode"], "ABCD-EFGH");
+        assert_eq!(value["flow"], "device");
+        assert_eq!(value["expiresIn"], 900);
+        assert_eq!(value["opened"], false);
+        assert!(value["openError"].is_null());
+    }
+
+    #[test]
+    fn oauth_start_keeps_device_metadata_optional_for_existing_providers() {
+        for extra in [serde_json::json!({}), serde_json::json!({
+            "user_code": " ", "flow": " ", "expires_in": 0,
+        })] {
+            let mut payload = serde_json::json!({
+                "url": "https://example.com/oauth",
+                "state": "oauth-state",
+            });
+            payload
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let result = normalize_oauth_start_response(
+                serde_json::from_value::<OAuthStartApiResponse>(payload).unwrap(),
+            )
+            .unwrap();
+
+            assert!(result.user_code.is_none());
+            assert!(result.flow.is_none());
+            assert!(result.expires_in.is_none());
         }
     }
 
