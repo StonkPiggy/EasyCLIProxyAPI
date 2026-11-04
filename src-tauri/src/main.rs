@@ -1,6 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod agents;
+mod agent_skills;
+mod agent_usage;
+mod agent_usage_store;
 mod app_settings;
 mod app_update;
 mod claude_catalog;
@@ -15,6 +18,7 @@ mod instance_lock;
 #[cfg(any(target_os = "linux", test))]
 mod linux_graphics;
 mod management_api;
+mod mcp_servers;
 mod network_proxy;
 #[cfg(any(
     target_os = "linux",
@@ -28,6 +32,7 @@ mod plugins;
 mod privacy_mode;
 mod progress;
 mod provider_health;
+mod reverse_proxy;
 #[cfg(any(
     target_os = "linux",
     target_os = "macos",
@@ -39,6 +44,8 @@ mod usage;
 mod windows_frame;
 mod window_material;
 mod window_activity;
+#[cfg(any(windows, test))]
+mod webview_recovery;
 
 #[cfg(test)]
 use configuration_watcher::nearest_existing_watch_directory;
@@ -112,12 +119,20 @@ const RELEASE_PAGE_URL: &str = "https://github.com/router-for-me/CLIProxyAPI/rel
 const RELEASE_ATOM_URL: &str = "https://github.com/router-for-me/CLIProxyAPI/releases.atom";
 const RELEASE_DOWNLOAD_PREFIX: &str =
     "https://github.com/router-for-me/CLIProxyAPI/releases/download/";
+const CORE_RELEASES_API_URL: &str =
+    "https://api.github.com/repos/router-for-me/CLIProxyAPI/releases?per_page=100";
 #[cfg(windows)]
 const APP_UPDATE_MANIFEST_URL: &str = "https://github.com/router-for-me/EasyCLIProxyAPI/releases/latest/download/portable-update-windows.json";
 #[cfg(target_os = "linux")]
 const APP_UPDATE_MANIFEST_URL: &str = "https://github.com/router-for-me/EasyCLIProxyAPI/releases/latest/download/portable-update-linux.json";
 #[cfg(target_os = "macos")]
 const APP_UPDATE_MANIFEST_URL: &str = "https://github.com/router-for-me/EasyCLIProxyAPI/releases/latest/download/portable-update-darwin-v2.json";
+#[cfg(windows)]
+const APP_UPDATE_MANIFEST_FILE: &str = "portable-update-windows.json";
+#[cfg(target_os = "linux")]
+const APP_UPDATE_MANIFEST_FILE: &str = "portable-update-linux.json";
+#[cfg(target_os = "macos")]
+const APP_UPDATE_MANIFEST_FILE: &str = "portable-update-darwin-v2.json";
 const APP_RELEASE_DOWNLOAD_PREFIX: &str =
     "https://github.com/router-for-me/EasyCLIProxyAPI/releases/download/";
 #[cfg(windows)]
@@ -450,6 +465,14 @@ struct CoreLatest {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct CoreVersionOption {
+    version: String,
+    asset_name: String,
+    prerelease: bool,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct AppUpdateInfo {
     current_version: String,
     latest_version: String,
@@ -457,9 +480,11 @@ struct AppUpdateInfo {
     release_url: String,
     release_notes: HashMap<String, String>,
     published_at: String,
+    current_build_at: Option<String>,
     auto_update_supported: bool,
     download_size_bytes: Option<u64>,
     unsupported_reason: Option<String>,
+    update_channel: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -497,6 +522,8 @@ struct PortableAppManifest {
     schema_version: u32,
     application: String,
     version: String,
+    #[serde(default)]
+    built_at: Option<String>,
     platform: String,
     arch: String,
     #[serde(default)]
@@ -635,6 +662,8 @@ struct GuiConfigFile {
     api_access_remarks: Vec<GuiApiAccessRemark>,
     management_secret_key: String,
     debug: bool,
+    #[serde(default = "default_update_channel")]
+    update_channel: String,
     commercial_mode: bool,
     logging_to_file: bool,
     logs_max_total_size_mb: u32,
@@ -946,6 +975,7 @@ impl Default for GuiConfigFile {
             api_access_remarks: Vec::new(),
             management_secret_key: LEGACY_DEFAULT_MANAGEMENT_SECRET_KEY.to_string(),
             debug: false,
+            update_channel: default_update_channel(),
             commercial_mode: false,
             logging_to_file: false,
             logs_max_total_size_mb: DEFAULT_LOGS_MAX_TOTAL_SIZE_MB,
@@ -1072,6 +1102,8 @@ struct AgentConfigStatus {
     configuration_synchronized: bool,
     connection_state: String,
     current_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_api_key: Option<String>,
     oauth_configuration: bool,
     codex_native_oauth: bool,
     codex_openai_provider: bool,
@@ -1200,6 +1232,8 @@ struct ClaudeDesktopModelMappings {
     /// Optional explicit model written to CLAUDE_CODE_SUBAGENT_MODEL.
     #[serde(default)]
     subagent_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    response_language: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1249,6 +1283,15 @@ fn default_true() -> bool {
     true
 }
 
+fn default_update_channel() -> String {
+    // A preview binary keeps following the preview channel until switched explicitly.
+    if env!("CARGO_PKG_VERSION").to_ascii_lowercase().contains("preview") {
+        "preview".to_string()
+    } else {
+        "stable".to_string()
+    }
+}
+
 impl ClaudeDesktopModelMappings {
     fn all(model: &str) -> Self {
         Self {
@@ -1268,6 +1311,7 @@ impl ClaudeDesktopModelMappings {
             manage_subagent_model: true,
             startup_model: None,
             subagent_model: None,
+            response_language: None,
         }
     }
 }
@@ -1629,6 +1673,12 @@ struct CoreConfigSettings {
     #[serde(skip_serializing)]
     auth_dir: String,
     api_keys: Vec<String>,
+    /// Whether the kernel configuration sets `auth-dir`; otherwise `auth_dir` is the kernel default.
+    #[serde(skip_serializing)]
+    auth_dir_configured: bool,
+    /// Whether the kernel configuration declares API keys other than the example placeholders.
+    #[serde(skip_serializing)]
+    api_keys_configured: bool,
     management_secret_configured: bool,
     debug: bool,
     commercial_mode: bool,
@@ -2226,6 +2276,13 @@ impl GuiConfigState {
         self.set_download_candidate(VersionDownloadCandidate::builtin(download_source))
     }
 
+    fn set_update_channel(&self, update_channel: &str) -> Result<GuiConfigFile, String> {
+        self.update(|config| {
+            config.update_channel = update_channel.to_string();
+            Ok(())
+        })
+    }
+
     fn set_download_candidate(
         &self,
         candidate: VersionDownloadCandidate,
@@ -2402,6 +2459,8 @@ impl From<&GuiConfigFile> for CoreConfigSettings {
             port: config.port,
             auth_dir: config.auth_dir.clone(),
             api_keys: gui_api_key_values(&config.api_keys),
+            auth_dir_configured: true,
+            api_keys_configured: true,
             management_secret_configured: !config.management_secret_key.is_empty(),
             debug: config.debug,
             commercial_mode: config.commercial_mode,
@@ -2517,6 +2576,10 @@ fn main() {
     let _instance_guard = match acquire_app_instance_guard() {
         Ok(guard) => guard,
         Err(error) => {
+            #[cfg(target_os = "linux")]
+            if portable_update_ack_argument().is_none() && request_running_app_activation() {
+                return;
+            }
             eprintln!("{error}");
             return;
         }
@@ -2559,7 +2622,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None,
+            Some(vec![AUTOSTART_ARGUMENT]),
         ))
         .plugin(
             tauri_plugin_opener::Builder::new()
@@ -2569,20 +2632,34 @@ fn main() {
         .manage(CoreDownloadState::default())
         .manage(AppUpdateState::default())
         .manage(window_activity::WindowActivity::default())
-        .manage(CoreProcessState::new(gui_config.start_core_on_launch))
+        .manage(CoreProcessState::new(should_start_core_on_launch(
+            &gui_config,
+        )))
         .manage(DeepSeekHarnessProcessState::default())
         .manage(usage::UsageCollectorState::default())
+        .manage(agent_usage::AgentUsageState::default())
         .manage(GuiConfigState::new(gui_config))
         .manage(plugin_webview::PluginWebviewState::default())
         .manage(MainWindowState::new(
             initial_window_size,
             initial_window_position,
         ))
-        .manage(AgentConfigStatusCache::default());
+        .manage(AgentConfigStatusCache::default())
+        .manage(reverse_proxy::ReverseProxyManagerState::default());
 
     let app = app.on_window_event(|window, event| {
         if window.label() != "main" {
             return;
+        }
+
+        #[cfg(windows)]
+        if matches!(
+            event,
+            tauri::WindowEvent::Resized(_)
+                | tauri::WindowEvent::ScaleFactorChanged { .. }
+                | tauri::WindowEvent::Focused(true)
+        ) {
+            webview_recovery::request(window.app_handle());
         }
 
         if matches!(event, tauri::WindowEvent::Resized(_) | tauri::WindowEvent::Focused(_)) {
@@ -2657,6 +2734,7 @@ fn main() {
             if let Some(window) = app.get_webview_window("main") {
                 windows_frame::install(&window)?;
                 window.set_decorations(false)?;
+                webview_recovery::install(&window)?;
             }
             if let Some(window) = app.get_webview_window("main") {
                 window.set_background_color(Some(tauri::window::Color(255, 255, 255, 255)))?;
@@ -2695,6 +2773,21 @@ fn main() {
                 eprintln!("Failed to configure startup window state: {error}");
             }
 
+            #[cfg(target_os = "linux")]
+            {
+                let activation_app = app.handle().clone();
+                if let Err(error) = start_app_activation_listener(move || {
+                    let app_handle = activation_app.clone();
+                    if let Err(error) = activation_app
+                        .run_on_main_thread(move || show_windows_main_window(&app_handle))
+                    {
+                        eprintln!("Failed to schedule showing the main window: {error}");
+                    }
+                }) {
+                    eprintln!("{error}");
+                }
+            }
+
             if let Err(error) =
                 configuration_watcher::start_configuration_file_watcher(app.handle().clone())
             {
@@ -2704,6 +2797,7 @@ fn main() {
             network_proxy::start_monitor(app.handle().clone());
             core_recovery::start(app.handle().clone());
             start_codex_model_catalog_sync(app.handle().clone());
+            agent_usage::start_background_sync(app.handle().clone());
 
             let usage_app = app.handle().clone();
             tauri::async_runtime::spawn_blocking(move || {
@@ -2727,6 +2821,7 @@ fn main() {
             });
 
             let core_app = app.handle().clone();
+            let runtime_update_ack = portable_update_ack.clone();
             tauri::async_runtime::spawn_blocking(move || {
                 let Ok(_guard) = CORE_OPERATION_LOCK.lock() else {
                     return;
@@ -2742,7 +2837,7 @@ fn main() {
                     return;
                 };
 
-                if config.start_core_on_launch {
+                if should_start_core_on_launch(&config) {
                     if let Ok(status) =
                         current_core_status(Some(process_state.inner()), Some(config.port))
                     {
@@ -2753,11 +2848,19 @@ fn main() {
                 match auto_install_bundled_core_if_needed(&core_app) {
                     Ok(true) => eprintln!("Automatically installed or upgraded to the CPA kernel version bundled with the application"),
                     Ok(false) => {}
-                    Err(error) => eprintln!("Failed to automatically install CPA offline kernel: {error}"),
+                    Err(error) => {
+                        eprintln!("Failed to automatically install CPA offline kernel: {error}");
+                        if runtime_update_ack.is_some() {
+                            process_state.set_starting(false);
+                            return;
+                        }
+                    }
                 }
 
-                let adopted_process_ids = match adopt_existing_core_processes(process_state.inner())
-                {
+                let adopted_process_ids = match adopt_existing_core_processes(
+                    process_state.inner(),
+                    &config,
+                ) {
                     Ok(process_ids) => process_ids,
                     Err(error) => {
                         eprintln!("Failed to scan for and adopt the CPA kernel in the current directory: {error}");
@@ -2774,8 +2877,18 @@ fn main() {
                             .join(", ")
                     );
                 } else if should_start_core_on_launch(&config) {
-                    if let Err(error) = start_core_process_inner(process_state.inner(), &config) {
+                    let start_result = retry_core_operation(3, Duration::from_millis(400), || {
+                        process_state.ensure_active()?;
+                        start_core_process_inner(process_state.inner(), &config)
+                    });
+                    if let Err(error) = start_result {
                         eprintln!("Failed to automatically start CPA kernel: {error}");
+                        if runtime_update_ack.is_some() {
+                            process_state.set_starting(false);
+                            return;
+                        }
+                    } else if let Err(error) = gui_config_state.set_run_on_startup(true) {
+                        eprintln!("Failed to save automatically started kernel state: {error}");
                     }
                 }
 
@@ -2786,12 +2899,19 @@ fn main() {
                 {
                     emit_core_status(&core_app, &status);
                 }
+                if let Some(ack_path) = runtime_update_ack.as_ref() {
+                    let core_expected =
+                        !adopted_process_ids.is_empty() || should_start_core_on_launch(&config);
+                    if let Err(error) = acknowledge_update_runtime(
+                        ack_path,
+                        process_state.inner(),
+                        &config,
+                        core_expected,
+                    ) {
+                        eprintln!("Application update runtime acceptance failed: {error}");
+                    }
+                }
             });
-
-            if let Some(ack_path) = portable_update_ack.as_ref() {
-                fs::write(ack_path, env!("CARGO_PKG_VERSION").as_bytes())
-                    .map_err(|error| format!("Failed to write application update startup confirmation: {error}"))?;
-            }
 
             Ok(())
         })
@@ -2812,6 +2932,21 @@ fn main() {
             get_gui_settings,
             get_usage_view_preferences,
             save_usage_view_preferences,
+            agent_usage::get_agent_usage,
+            agent_usage::sync_agent_usage,
+            agent_usage::get_agent_usage_storage,
+            agent_usage::clear_agent_usage_history,
+            mcp_servers::list_mcp_servers,
+            mcp_servers::save_mcp_server,
+            mcp_servers::delete_mcp_server,
+            mcp_servers::set_mcp_server_enabled,
+            mcp_servers::sync_mcp_server_to_openclaw,
+            mcp_servers::import_mcp_servers_json,
+            mcp_servers::export_mcp_servers_json,
+            mcp_servers::open_mcp_skills_directory,
+            agent_skills::list_skills,
+            agent_skills::get_skill_detail,
+            agent_skills::set_skill_enabled,
             resolve_api_access_remarks,
             save_api_access_remark,
             set_app_locale,
@@ -2819,6 +2954,7 @@ fn main() {
             get_software_settings,
             save_software_settings,
             get_agent_config_statuses,
+            get_agent_environment_options,
             create_agent_config_backup,
             list_agent_config_backups,
             preview_agent_config_backup,
@@ -2839,6 +2975,8 @@ fn main() {
             save_deepseek_harness_model_catalog_editor,
             get_codex_model_catalog_editor,
             save_codex_model_catalog_editor,
+            get_zcode_model_catalog_editor,
+            save_zcode_model_catalog_editor,
             get_thinking_aliases,
             get_model_alias_sources,
             get_model_alias_edit_source,
@@ -2856,6 +2994,8 @@ fn main() {
             set_codex_remote_compaction,
             get_codex_subagent_config,
             save_codex_subagent_config,
+            get_zcode_subagent_config,
+            save_zcode_subagent_config,
             close_codex_config_modification,
             set_agent_config_enabled,
             update_agent_config,
@@ -2921,11 +3061,15 @@ fn main() {
             add_custom_download_mirror,
             remove_custom_download_mirror,
             set_prefer_gitcode_downloads,
+            get_update_channel,
+            list_update_channels,
+            set_update_channel,
             check_app_update,
             get_app_update_task,
             start_app_update,
             cancel_app_update,
             check_latest_core,
+            core_runtime::list_core_versions,
             detect_bundled_core,
             install_core_version,
             install_bundled_core,
@@ -2955,7 +3099,11 @@ fn main() {
             codex_sessions::apply_codex_session_index_cleanup,
             codex_sessions::context::get_codex_session_context,
             codex_sessions::context::save_codex_session_context,
-            codex_sessions::context::open_codex_session_rollout
+            codex_sessions::context::open_codex_session_rollout,
+            reverse_proxy::reverse_proxy_get_state,
+            reverse_proxy::reverse_proxy_apply,
+            reverse_proxy::reverse_proxy_start,
+            reverse_proxy::reverse_proxy_stop
         ])
         .build(context)
         .expect("failed to build app");
@@ -2967,6 +3115,8 @@ fn main() {
             ..
         } => show_main_window(app_handle),
         tauri::RunEvent::ExitRequested { api, code, .. } => {
+            #[cfg(windows)]
+            webview_recovery::stop(app_handle);
             let process_state = app_handle.state::<CoreProcessState>();
             if process_state.shutdown_complete.load(Ordering::Acquire) {
                 return;
@@ -2995,6 +3145,8 @@ fn main() {
             });
         }
         tauri::RunEvent::Exit => {
+            #[cfg(windows)]
+            webview_recovery::stop(app_handle);
             usage::stop_usage_collector(app_handle);
             let deepseek_process_state = app_handle.state::<DeepSeekHarnessProcessState>();
             if let Err(error) = stop_managed_deepseek_harness(deepseek_process_state.inner()) {

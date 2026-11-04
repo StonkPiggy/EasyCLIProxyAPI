@@ -846,6 +846,13 @@ pub(crate) fn build_claude_agent_config(
         .cloned()
         .unwrap_or_else(|| ClaudeDesktopModelMappings::all(model));
     let max_context_tokens = mappings.max_context_tokens;
+    if let Some(language) = &mappings.response_language {
+        if language.trim().is_empty() {
+            root.remove("language");
+        } else {
+            root.insert("language".into(), serde_json::Value::String(language.clone()));
+        }
+    }
     let model_settings = claude_code_model_settings(&mappings);
     let subagent_model = model_settings.haiku.clone();
     // Explicit/default session selections may switch roles, while Subagents may use
@@ -3668,6 +3675,80 @@ pub(crate) fn validate_codex_catalog(catalog: &str, model: &str) -> Result<(), S
     Ok(())
 }
 
+pub(crate) fn opencode_model_entry(
+    model: &AgentModelOption,
+    existing: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let mut entry = existing
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let display_name = model.alias.as_deref().unwrap_or(&model.name).to_string();
+    entry.insert("name".to_string(), serde_json::json!(display_name));
+
+    let lower = model.name.to_ascii_lowercase();
+    let declared_image = model
+        .input_modalities
+        .as_ref()
+        .map(|m| m.iter().any(|v| v.eq_ignore_ascii_case("image")));
+    let heuristic_image = [
+        "claude",
+        "gemini",
+        "gpt-4o",
+        "gpt-4.1",
+        "gpt-5",
+        "o3",
+        "o4",
+        "qwen-vl",
+        "qwen2.5-vl",
+        "qwen3-vl",
+        "glm-4v",
+        "glm-4.5v",
+        "pixtral",
+        "llama-4",
+        "kimi-vl",
+        "doubao-vision",
+        "step-1v",
+        "internvl",
+        "phi-4-multimodal",
+    ]
+    .iter()
+    .any(|k| lower.contains(k));
+    let supports_image = declared_image.unwrap_or(heuristic_image);
+    let image_output = lower.contains("-image")
+        || lower.starts_with("imagen")
+        || lower.contains("dall-e")
+        || lower.contains("gpt-image")
+        || lower.contains("seedream")
+        || lower.contains("flux");
+
+    if image_output || supports_image {
+        entry.insert("attachment".to_string(), serde_json::json!(true));
+        entry.insert(
+            "modalities".to_string(),
+            serde_json::json!({
+                "input": ["text", "image", "pdf"],
+                "output": if image_output {
+                    vec!["text", "image"]
+                } else {
+                    vec!["text"]
+                }
+            }),
+        );
+    } else {
+        entry.remove("attachment");
+        entry.insert(
+            "modalities".to_string(),
+            serde_json::json!({
+                "input": ["text"],
+                "output": ["text"]
+            }),
+        );
+    }
+
+    serde_json::Value::Object(entry)
+}
+
 pub(crate) fn build_opencode_agent_config(
     existing: Option<&str>,
     base_url: &str,
@@ -3679,14 +3760,20 @@ pub(crate) fn build_opencode_agent_config(
     root.entry("$schema".to_string())
         .or_insert_with(|| serde_json::json!("https://opencode.ai/config.json"));
     let providers = ensure_json_object_entry(&mut root, "provider");
+    let managed_provider = ensure_json_object_entry(providers, MANAGED_AGENT_PROVIDER_ID);
+    let existing_models = managed_provider
+        .get("models")
+        .and_then(serde_json::Value::as_object)
+        .cloned();
     let models = ordered_agent_models(available_models, model)
         .into_iter()
         .map(|model| {
-            let display_name = model.alias.as_deref().unwrap_or(&model.name).to_string();
-            (model.name, serde_json::json!({ "name": display_name }))
+            let existing_entry = existing_models
+                .as_ref()
+                .and_then(|models| models.get(&model.name));
+            (model.name.clone(), opencode_model_entry(&model, existing_entry))
         })
         .collect::<serde_json::Map<_, _>>();
-    let managed_provider = ensure_json_object_entry(providers, MANAGED_AGENT_PROVIDER_ID);
     managed_provider.insert(
         "npm".to_string(),
         serde_json::json!("@ai-sdk/openai-compatible"),
@@ -3709,7 +3796,7 @@ pub(crate) fn build_opencode_agent_config(
     }
 }
 
-const ZCODE_CPA_REASONING_MAP: &str = "reasoningLevel == \"none\" ? {\"thinking\": {\"type\": \"disabled\"}} : {\"thinking\": {\"type\": \"adaptive\"}, \"output_config\": {\"effort\": reasoningLevel}}";
+const ZCODE_CPA_REASONING_MAP: &str = super::zcode::ZCODE_CPA_REASONING_MAP;
 
 pub(crate) fn build_zcode_agent_config(
     existing: Option<&str>,
@@ -3750,8 +3837,8 @@ pub(crate) fn build_zcode_agent_config(
     api.insert("baseUrl".to_string(), serde_json::json!(base_url));
     let ordered = ordered_agent_models(available_models, model);
     let model_names = ordered.iter().map(|option| option.name.as_str()).collect::<Vec<_>>();
-    provider_config.insert("personalModelIds".to_string(), serde_json::json!(model_names));
-    provider_config.insert("modelOrder".to_string(), serde_json::json!(model_names));
+    provider_config.entry("personalModelIds").or_insert_with(|| serde_json::json!(model_names));
+    provider_config.entry("modelOrder").or_insert_with(|| serde_json::json!(model_names));
     rules.retain(|rule| {
         rule.get("providerId").and_then(serde_json::Value::as_str)
             != Some(MANAGED_AGENT_PROVIDER_ID)
@@ -3803,35 +3890,51 @@ pub(crate) fn build_zcode_agent_config(
         let entry = rule.as_object_mut().ok_or("ZCode model rule must be an object")?;
         entry.insert("providerId".to_string(), serde_json::json!(MANAGED_AGENT_PROVIDER_ID));
         entry.insert("modelId".to_string(), serde_json::json!(option.name));
-        let properties = ensure_json_object_entry(ensure_json_object_entry(entry, "config"), "properties");
-        ensure_json_object_entry(properties, "inputFormat")
-            .entry("supportsImage")
-            .or_insert(serde_json::json!(true));
-        if let Some(context_window) = option.context_window {
-            properties.insert("contextWindow".to_string(), serde_json::json!(context_window));
-        } else if manual.is_none() {
-            // Smart rules inherit ZCode defaults; manual rules require a complete
-            // config, including contextWindow, even when CPA has no runtime limit.
-            properties.remove("contextWindow");
+        let (inferred_cw, inferred_mot, _, _, _) = zcode::infer_zcode_model_knowledge_with_calibration(&option.name);
+        let config_obj = ensure_json_object_entry(entry, "config");
+        {
+            let properties = ensure_json_object_entry(config_obj, "properties");
+            ensure_json_object_entry(properties, "inputFormat")
+                .entry("supportsImage")
+                .or_insert(serde_json::json!(true));
+            properties.remove("maxOutputTokens");
+            let effective_cw = match option.context_window {
+                Some(500_000) | None => manual
+                    .and_then(|rule| rule.pointer("/config/properties/contextWindow"))
+                    .and_then(serde_json::Value::as_u64)
+                    .or(inferred_cw)
+                    .or(option.context_window),
+                Some(cw) => Some(cw).or(inferred_cw),
+            };
+            if let Some(context_window) = effective_cw {
+                properties.insert("contextWindow".to_string(), serde_json::json!(context_window));
+            } else if manual.is_none() {
+                properties.remove("contextWindow");
+            }
         }
-        if properties.is_empty() {
-            entry.get_mut("config").and_then(serde_json::Value::as_object_mut)
-                .expect("ZCode model config was created").remove("properties");
+        let specs = ensure_json_object_entry(config_obj, "optionSpecs");
+        if let Some(mot) = inferred_mot {
+            specs.entry("maxOutputTokens").or_insert_with(|| serde_json::json!({
+                "max": mot,
+                "map": "{\"max_tokens\": maxOutputTokens}",
+            }));
         }
         if !option.reasoning_levels.is_empty() {
-            let specs = ensure_json_object_entry(ensure_json_object_entry(entry, "config"), "optionSpecs");
-            // Respect explicit native/manual options, including an intentional null.
-            // Smart defaults for unknown IDs otherwise expose only an on/off switch
-            // with a no-op map. CPA accepts effort through the Messages API.
+            let is_generated_map = |m: &str| {
+                m == ZCODE_CPA_REASONING_MAP || m == "reasoningLevel == \"none\" ? {\"thinking\": {\"type\": \"disabled\"}} : {\"thinking\": {\"type\": \"adaptive\"}, \"output_config\": {\"effort\": reasoningLevel}}"
+            };
             let generated = manual.is_none() && specs.get("reasoningLevel")
                 .and_then(|spec| spec.get("map")).and_then(serde_json::Value::as_str)
-                == Some(ZCODE_CPA_REASONING_MAP);
+                .map(is_generated_map).unwrap_or(false);
             if generated || !specs.contains_key("reasoningLevel") {
                 specs.insert("reasoningLevel".into(), serde_json::json!({
                     "values": option.reasoning_levels,
                     "map": ZCODE_CPA_REASONING_MAP,
                 }));
             }
+        }
+        if specs.is_empty() {
+            config_obj.remove("optionSpecs");
         }
         if manual.is_some() {
             manual_updates.push(rule);

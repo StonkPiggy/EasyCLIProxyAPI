@@ -1,8 +1,21 @@
 import { isRecord, managementApi, readBoolean, readString } from './managementApi';
 import { getCurrentLocale, translate } from '../i18n';
+import { normalizeAuthFileTags } from './credentialTags';
+export { normalizeAuthFileTags } from './credentialTags';
 
 export type AuthFileRecord = Record<string, unknown>;
 export type AuthFileSnapshot = Map<string, string>;
+
+export const countAuthFileTags = (files: AuthFileRecord[]): Map<string, number> => {
+  const counts = new Map<string, number>();
+  for (const file of files) {
+    for (const tag of normalizeAuthFileTags(file.tags)) {
+      counts.set(tag, (counts.get(tag) ?? 0) + 1);
+    }
+  }
+  return counts;
+};
+
 
 export type AuthFileCooldownResetResponse = {
   status: 'ok';
@@ -227,7 +240,7 @@ const mergeDuplicateAuthFiles = (entries: AuthFileRecord[]) => {
   sorted.slice(1).forEach((entry) => {
     Object.entries(entry).forEach(([key, value]) => {
       if (authFileSourceFields.has(key)) return;
-      if (key === 'cooldowns' && Object.prototype.hasOwnProperty.call(merged, key)) return;
+      if ((key === 'cooldowns' || key === 'tags') && Object.prototype.hasOwnProperty.call(merged, key)) return;
       if (!hasMeaningfulValue(merged[key]) && hasMeaningfulValue(value)) merged[key] = value;
     });
   });

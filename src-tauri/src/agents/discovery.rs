@@ -18,7 +18,8 @@ pub(crate) fn agent_configuration_environment(_: &str) -> Option<PathBuf> {
 pub(crate) fn agent_config_paths(client: AgentClient, home: &Path) -> Vec<PathBuf> {
     match client {
         AgentClient::ClaudeCode => {
-            let directory = home.join(".claude");
+            let directory =
+                agent_config_directory("claude-code").unwrap_or_else(|| home.join(".claude"));
             let settings = directory.join("settings.json");
             let legacy = directory.join("claude.json");
             let settings_state_exists = agent_state_path(std::slice::from_ref(&settings))
@@ -49,12 +50,18 @@ pub(crate) fn agent_config_paths(client: AgentClient, home: &Path) -> Vec<PathBu
         AgentClient::GrokBuild => vec![grok_build_home(home).join(GROK_BUILD_CONFIG_FILE)],
         AgentClient::Omp => {
             let directory = omp_agent_directory(home);
-            vec![directory.join(OMP_MODELS_FILE), directory.join(OMP_SETTINGS_FILE)]
+            vec![
+                directory.join(OMP_MODELS_FILE),
+                directory.join(OMP_SETTINGS_FILE),
+            ]
         }
     }
 }
 
 pub(crate) fn opencode_config_path(home: &Path) -> PathBuf {
+    if let Some(directory) = agent_config_directory("opencode") {
+        return select_opencode_config(&directory);
+    }
     #[cfg(test)]
     let (custom_config, xdg_config_home): (Option<PathBuf>, Option<PathBuf>) = (None, None);
     #[cfg(not(test))]
@@ -82,6 +89,10 @@ pub(crate) fn opencode_config_path_from_environment(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| home.join(".config"))
         .join("opencode");
+    select_opencode_config(&config_directory)
+}
+
+fn select_opencode_config(config_directory: &Path) -> PathBuf {
     let json = config_directory.join("opencode.json");
     let jsonc = config_directory.join("opencode.jsonc");
     let candidates = [json.clone(), jsonc];
@@ -99,6 +110,9 @@ pub(crate) fn opencode_config_path_from_environment(
 }
 
 pub(crate) fn openclaw_agent_config_path(home: &Path) -> PathBuf {
+    if let Some(directory) = agent_config_directory("openclaw") {
+        return directory.join("openclaw.json");
+    }
     #[cfg(test)]
     let (custom_config, state_directory, openclaw_home): (
         Option<PathBuf>,
@@ -155,18 +169,31 @@ fn expand_openclaw_path(home: &Path, path: &Path) -> PathBuf {
 }
 
 pub(crate) fn kimi_code_home(home: &Path) -> PathBuf {
+    if let Some(directory) = agent_config_directory("kimi-code") {
+        return directory;
+    }
     agent_configuration_environment("KIMI_CODE_HOME").unwrap_or_else(|| home.join(".kimi-code"))
 }
 
 pub(crate) fn grok_build_home(home: &Path) -> PathBuf {
+    if let Some(directory) = agent_config_directory("grok-build") {
+        return directory;
+    }
     agent_configuration_environment("GROK_HOME").unwrap_or_else(|| home.join(".grok"))
 }
 
 pub(crate) fn omp_agent_directory(home: &Path) -> PathBuf {
-    agent_configuration_environment("PI_CODING_AGENT_DIR").unwrap_or_else(|| home.join(".omp/agent"))
+    if let Some(directory) = agent_config_directory("omp") {
+        return directory;
+    }
+    agent_configuration_environment("PI_CODING_AGENT_DIR")
+        .unwrap_or_else(|| home.join(".omp/agent"))
 }
 
 pub(crate) fn deepseek_harness_home(home: &Path) -> PathBuf {
+    if let Some(directory) = agent_config_directory("deepseek-harness") {
+        return directory;
+    }
     agent_configuration_environment("DSH_HOME").unwrap_or_else(|| home.join(".dsh"))
 }
 
@@ -252,6 +279,9 @@ pub(crate) fn read_package_json_version(path: &Path) -> Option<String> {
 }
 
 pub(crate) fn pi_agent_directory(home: &Path) -> PathBuf {
+    if let Some(directory) = agent_config_directory("pi") {
+        return directory;
+    }
     agent_configuration_environment("PI_CODING_AGENT_DIR").unwrap_or_else(|| home.join(".pi/agent"))
 }
 
@@ -572,6 +602,7 @@ pub(crate) fn inspect_pi_provider_status_with_executable(
         )
         .into(),
         current_model: current_model.clone(),
+        current_api_key: if configured { Some(api_key.to_string()) } else { None },
         oauth_configuration: false,
         codex_native_oauth: false,
         codex_openai_provider: false,
@@ -894,6 +925,9 @@ pub(crate) fn remove_pi_package(executable: &Path, home: &Path) -> Result<(), St
 }
 
 pub(crate) fn codex_configuration_directory(home: &Path) -> PathBuf {
+    if let Some(directory) = agent_config_directory("codex") {
+        return directory;
+    }
     agent_configuration_environment("CODEX_HOME").unwrap_or_else(|| home.join(".codex"))
 }
 
@@ -902,6 +936,9 @@ pub(crate) fn codex_configuration_directory(home: &Path) -> PathBuf {
 // lives under `<dataBaseDir>/.zcode/v2/`. Fall back to the default location when
 // the setting is missing or unreadable.
 pub(crate) fn zcode_config_directory(home: &Path) -> PathBuf {
+    if let Some(directory) = agent_config_directory("zcode") {
+        return directory;
+    }
     if let Some(custom) = agent_configuration_environment("ZCODE_HOME") {
         return custom.join(".zcode/v2");
     }
@@ -1025,6 +1062,12 @@ pub(crate) fn expected_agent_record_paths(client: AgentClient, paths: &[PathBuf]
 }
 
 pub(crate) fn claude_desktop_config_paths(_home: &Path) -> Vec<PathBuf> {
+    if let Some(directory) = agent_config_directory("claude-desktop") {
+        return claude_desktop_config_paths_from_directories(
+            directory.clone(),
+            directory.join("Claude-3p"),
+        );
+    }
     #[cfg(target_os = "macos")]
     let (normal, threep) = {
         let support = _home.join("Library/Application Support");
@@ -1105,6 +1148,9 @@ pub(crate) fn find_windows_claude_data_directory(
 }
 
 pub(crate) fn hermes_agent_config_path(home: &Path) -> PathBuf {
+    if let Some(directory) = agent_config_directory("hermes") {
+        return directory.join("config.yaml");
+    }
     if let Some(directory) = agent_configuration_environment("HERMES_HOME") {
         return directory.join("config.yaml");
     }
@@ -1305,6 +1351,7 @@ pub(crate) fn inspect_agent_config_with_executables(
         )
         .into(),
         current_model: current_model.clone(),
+        current_api_key: if configured { Some(api_key.to_string()) } else { None },
         oauth_configuration,
         codex_native_oauth: client == AgentClient::Codex
             && codex_native_oauth_enabled(home).unwrap_or(false),
@@ -2365,7 +2412,11 @@ pub(crate) fn read_claude_desktop_version(home: &Path) -> Option<String> {
             read_macos_app_version(application)
         })
     }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        find_claude_desktop_executable(home).and_then(|path| read_agent_version(&path, home))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
         let _ = home;
         None
@@ -2620,7 +2671,7 @@ pub(crate) fn read_codex_asar_version(path: &Path) -> Option<String> {
     normalize_detected_agent_version(package.get("version")?.as_str()?)
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 pub(crate) fn windows_powershell_single_quoted_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
@@ -2679,6 +2730,9 @@ pub(crate) fn find_agent_executable(client: AgentClient, home: &Path) -> Option<
     }
     if client == AgentClient::OpenCode {
         return find_opencode_executable(home);
+    }
+    if client == AgentClient::Codex {
+        return find_codex_executable(home);
     }
     if client == AgentClient::DeepSeekHarness {
         return find_deepseek_harness_executable(home);
@@ -2806,6 +2860,14 @@ pub(crate) fn find_named_agent_executable_in_directories(
     directories: &[PathBuf],
     names: &[&str],
 ) -> Option<PathBuf> {
+    find_all_named_agent_executables_in_directories(directories, names).into_iter().next()
+}
+
+pub(crate) fn find_all_named_agent_executables_in_directories(
+    directories: &[PathBuf],
+    names: &[&str],
+) -> Vec<PathBuf> {
+    let mut result = Vec::new();
     for directory in directories {
         for name in names {
             #[cfg(target_os = "windows")]
@@ -2817,15 +2879,42 @@ pub(crate) fn find_named_agent_executable_in_directories(
             ];
             #[cfg(not(target_os = "windows"))]
             let candidates = [directory.join(name)];
-            if let Some(candidate) = candidates
-                .into_iter()
-                .find(|path| agent_cli_executable(path))
-            {
-                return Some(candidate);
+            for candidate in candidates {
+                if agent_cli_executable(&candidate) && !result.contains(&candidate) {
+                    result.push(candidate);
+                }
             }
         }
     }
-    None
+    result
+}
+
+pub(crate) fn find_codex_executable(home: &Path) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    #[cfg(target_os = "windows")]
+    {
+        let local_app_data = env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join("AppData/Local"));
+        let bin_root = local_app_data.join("OpenAI/Codex/bin");
+        if let Ok(entries) = fs::read_dir(&bin_root) {
+            for entry in entries.flatten() {
+                let candidate = entry.path().join("codex.exe");
+                if agent_cli_executable(&candidate) {
+                    candidates.push(candidate);
+                }
+            }
+        }
+    }
+    let directories = agent_executable_directories(home);
+    candidates.extend(find_all_named_agent_executables_in_directories(&directories, &["codex"]));
+
+    for candidate in &candidates {
+        if read_agent_version(candidate, home).is_some() {
+            return Some(candidate.clone());
+        }
+    }
+    candidates.into_iter().next()
 }
 
 pub(crate) fn agent_executable_directories(home: &Path) -> Vec<PathBuf> {
@@ -3167,9 +3256,8 @@ pub(crate) fn inspect_claude_code_model_mappings(
             .map_err(|error| format!("Failed to read Claude Code configuration: {error}"))?,
     )
     .map_err(|error| format!("Failed to parse Claude Code configuration: {error}"))?;
-    let Some(env) = root.get("env").and_then(serde_json::Value::as_object) else {
-        return Ok(None);
-    };
+    let empty_env = serde_json::Map::new();
+    let env = root.get("env").and_then(serde_json::Value::as_object).unwrap_or(&empty_env);
     let fallback = env
         .get("ANTHROPIC_MODEL")
         .and_then(serde_json::Value::as_str)
@@ -3182,7 +3270,8 @@ pub(crate) fn inspect_claude_code_model_mappings(
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .or(fallback)?;
+            .or(fallback)
+            .or_else(|| root.get("language").and_then(serde_json::Value::as_str).map(|_| ""))?;
         let normalized = strip_claude_code_context_suffix(value);
         Some((normalized.to_string(), normalized.len() != value.len()))
     };
@@ -3255,6 +3344,7 @@ pub(crate) fn inspect_claude_code_model_mappings(
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_string()),
+        response_language: root.get("language").and_then(serde_json::Value::as_str).map(str::to_string),
     }))
 }
 
@@ -3387,6 +3477,7 @@ pub(crate) fn claude_code_model_settings(
         manage_subagent_model: mappings.manage_subagent_model,
         startup_model: mappings.startup_model.clone(),
         subagent_model: mappings.subagent_model.clone(),
+        response_language: mappings.response_language.clone(),
     }
 }
 
