@@ -816,11 +816,14 @@ textarea:focus-visible {
   align-items: center;
 }
 
-.app-module-card .version-card-actions {
+.app-module-card .version-card-actions,
+.app-module-card .version-card-actions.actions-count-2 {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
-.app-module-card .version-card-actions.has-install-now {
+.app-module-card .version-card-actions.has-install-now,
+.app-module-card .version-card-actions.actions-count-3,
+.app-module-card .version-card-actions:has(> :nth-child(3)) {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
@@ -1467,7 +1470,10 @@ textarea:focus-visible {
 
   .version-card-actions,
   .app-module-card .version-card-actions,
+  .app-module-card .version-card-actions.actions-count-2,
+  .app-module-card .version-card-actions.actions-count-3,
   .app-module-card .version-card-actions.has-install-now,
+  .app-module-card .version-card-actions:has(> :nth-child(3)),
   .core-module-card .version-card-actions {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -3922,6 +3928,9 @@ textarea:focus-visible {
 .provider-health-overview p {
   min-width: 0;
   color: var(--color-warning-text);
+  word-break: keep-all;
+  overflow-wrap: break-word;
+  line-break: strict;
 }
 
 .provider-health-overview span {
@@ -3953,7 +3962,7 @@ textarea:focus-visible {
 
 .provider-health-model-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto 88px;
+  grid-template-columns: minmax(0, 1fr) auto auto 88px;
   align-items: center;
   gap: 10px;
   min-height: 54px;
@@ -3967,6 +3976,36 @@ textarea:focus-visible {
 
 .provider-health-model-row.failed {
   background: var(--color-danger-subtle);
+}
+
+.provider-health-model-row.disabled {
+  background: var(--color-surface-sunken);
+}
+
+.provider-health-model-row.disabled .provider-health-model-name strong,
+.provider-health-model-row.disabled .provider-health-model-pill {
+  opacity: 0.55;
+}
+
+.provider-health-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 7px;
+  min-width: 0;
+  font-size: var(--font-size-meta);
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.provider-health-toggle .switch-control {
+  flex: none;
+}
+
+.provider-health-toggle:has(input:disabled) {
+  cursor: default;
+  color: var(--color-text-muted);
 }
 
 .provider-health-model-name {
@@ -6729,6 +6768,9 @@ textarea:focus-visible {
   align-items: center;
   gap: 4px;
   width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
 }
 
 .codex-catalog-row > button[role='option'] {
@@ -6736,6 +6778,8 @@ textarea:focus-visible {
   gap: 2px;
   width: 100%;
   min-width: 0;
+  overflow: hidden;
+  box-sizing: border-box;
   padding: 9px 10px;
   border: 1px solid transparent;
   border-radius: var(--radius-md);
@@ -7315,6 +7359,14 @@ textarea:focus-visible {
   background: var(--color-surface-hover);
 }
 
+.codex-catalog-dialog .codex-catalog-sidebar {
+  grid-template-rows: auto auto minmax(0, 1fr);
+}
+
+.harness-catalog-dialog .codex-catalog-sidebar {
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+}
+
 .codex-catalog-search {
   display: flex;
   align-items: center;
@@ -7334,6 +7386,29 @@ textarea:focus-visible {
   outline: 0;
   background: transparent;
   color: var(--color-text-primary);
+}
+
+.codex-catalog-batch-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.codex-catalog-model-row-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.codex-catalog-model-toggle {
+  flex-shrink: 0;
+}
+
+.codex-catalog-models > button.is-hidden strong,
+.codex-catalog-models > button.is-hidden > span {
+  opacity: 0.6;
 }
 
 .codex-catalog-models {
@@ -7382,8 +7457,12 @@ textarea:focus-visible {
   color: var(--color-success-text);
 }
 
-.codex-catalog-reload {
+.codex-catalog-sidebar .codex-catalog-reload {
   width: 100%;
+}
+
+.codex-catalog-footer .codex-catalog-reload {
+  width: auto;
 }
 
 .codex-catalog-editor {
@@ -7597,6 +7676,42 @@ textarea:focus-visible {
   gap: 8px;
 }
 
+.codex-catalog-footer-sidebar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  width: 250px;
+}
+
+.codex-catalog-footer-sidebar button {
+  flex: 1 1 0;
+  min-width: 0;
+  padding-left: 6px;
+  padding-right: 6px;
+  font-size: var(--font-size-meta);
+  white-space: nowrap;
+}
+
+.codex-catalog-footer-hint {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+  flex: 1 1 auto;
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-meta);
+  text-align: right;
+}
+
+.codex-catalog-footer-actions {
+  display: flex;
+  align-items: center;
+  flex: none;
+  gap: 8px;
+}
+
 @media (max-width: 760px) {
   .codex-catalog-dialog {
     width: calc(100vw - 28px);
@@ -7615,6 +7730,14 @@ textarea:focus-visible {
     border-right: 0;
     border-bottom: 1px solid var(--color-border-strong);
   }
+  .codex-catalog-dialog .codex-catalog-sidebar {
+    grid-template-rows: auto auto minmax(0, 1fr);
+  }
+
+  .codex-catalog-batch-actions {
+    grid-column: 1 / -1;
+  }
+
 
   .codex-catalog-models {
     grid-column: 1 / -1;
@@ -7640,6 +7763,20 @@ textarea:focus-visible {
   .codex-catalog-footer {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .codex-catalog-footer-sidebar {
+    width: 100%;
+  }
+
+  .codex-catalog-footer-hint {
+    justify-content: center;
+    text-align: center;
+  }
+
+  .codex-catalog-footer-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
   }
 
   .codex-catalog-footer > div:last-child {
@@ -8899,6 +9036,12 @@ textarea:focus-visible {
   color: var(--color-text-muted);
   font-size: var(--font-size-caption);
   line-height: 1.5;
+}
+
+.usage-column-dialog-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 .usage-error-collapse-setting {
@@ -11239,6 +11382,23 @@ textarea:focus-visible {
 
   .provider-health-model-row {
     grid-template-columns: minmax(0, 1fr) auto;
+    gap: 4px 10px;
+    padding: 9px 10px;
+  }
+
+  .provider-health-toggle {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    justify-content: flex-start;
+    padding-left: 0;
+  }
+
+  .provider-health-model-row .provider-health-pill {
+    grid-column: 1 / -1;
+    grid-row: 3;
+    justify-self: start;
+    max-width: 100%;
+    align-self: center;
   }
 
   .provider-health-single-button {
