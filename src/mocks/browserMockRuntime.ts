@@ -7,6 +7,9 @@ import { createQuotaMock, createQuotaMockFiles } from './quotaMock';
 import { normalizeAuthFileTags } from '../services/authFiles';
 import { hasDeepSeekArgumentConflict, parseAgentLaunchArguments } from '../services/agentLaunchArguments';
 
+
+
+
 export type BrowserMockScenario = 'running' | 'stopped' | 'empty' | 'error';
 export type BrowserMockMode = BrowserMockScenario | 'off';
 
@@ -497,6 +500,8 @@ function createState(scenario: BrowserMockScenario) {
     sensitiveWords: {
       antigravitySensitiveWords: ['internal-only', 'mock-secret'],
       devinSensitiveWords: ['private-repository'],
+      antigravitySensitiveWordsReplace: { Codex: 'Assistant' } as Record<string, string>,
+      devinSensitiveWordsReplace: {} as Record<string, string>,
     },
     appUpdateInfo: {
       currentVersion: '0.2.97',
@@ -901,6 +906,9 @@ function managementResponse(state: BrowserMockState, payload: JsonObject) {
     return clone(file);
   }
   if (method === 'GET' && path === '/credentials/models') return mockModelDefinitions();
+  if (method === 'POST' && path === '/models/refresh') {
+    return { ok: true, status: 'ok', changed_providers: [], catalog: [], codex_catalog: [], devin_catalog: [], sources: [], catalogs: [] };
+  }
   if (method === 'GET' && path.startsWith('/routing/model-definitions/')) return mockModelDefinitions();
   if (method === 'GET' && path === '/config/oauth/excluded-models') {
     return clone(state.oauthExcludedModels);
@@ -1449,6 +1457,11 @@ export function createBrowserMockRuntime(
       case 'get_software_settings': return clone(state.softwareSettings);
       case 'get_core_tls_settings': return clone(state.tlsSettings);
       case 'get_core_sensitive_words_settings': return clone(state.sensitiveWords);
+      case 'fetch_latest_sensitive_word_rules': return { rules: [
+        { provider: 'antigravity', kind: 'replace', target: 'Codex', replacement: 'Cloud Assistant' },
+        { provider: 'devin', kind: 'replace', target: 'Claude Code', replacement: 'Devin Assistant' },
+        { provider: 'antigravity', kind: 'obfuscate', target: 'cloud-word', replacement: '' },
+      ] };
       case 'save_core_sensitive_words_settings': {
         state.sensitiveWords = clone(asObject(payload.settings)) as typeof state.sensitiveWords;
         emit('config-files-changed', { paths: ['cpa-core/config.yaml'], errors: [] });
@@ -1509,6 +1522,7 @@ export function createBrowserMockRuntime(
       }
 
       case 'check_app_update': return clone(state.appUpdateInfo);
+      case 'refresh_managed_codex_model_catalog': return false;
       case 'get_app_update_task': return clone(state.appUpdateTask);
       case 'get_update_channel': return state.appUpdateInfo.updateChannel ?? 'stable';
       case 'list_update_channels': return ['stable', 'preview', 'preview-20261104-1623'];
