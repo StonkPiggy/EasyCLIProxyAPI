@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod agents;
+mod acp;
 mod agent_skills;
 mod agent_usage;
 mod agent_usage_store;
@@ -213,11 +214,11 @@ const PI_AGENT_MODELS_CACHE_FILE: &str = "cliproxyapi-models.json";
 const CODEX_MODEL_CATALOG_FILE: &str = "cpa-gui-model-catalog.json";
 const CODEX_OAUTH_LOGIN_REQUIRED_ERROR: &str = "CODEX_OAUTH_LOGIN_REQUIRED";
 const CLAUDE_DESKTOP_PROFILE_ID: &str = "00000000-0000-4000-8000-000000831700";
-const CLAUDE_DESKTOP_OPUS_MODEL_ID: &str = "claude-opus-5-cpa";
-const CLAUDE_DESKTOP_SONNET_MODEL_ID: &str = "claude-sonnet-5-cpa";
-const CLAUDE_DESKTOP_HAIKU_MODEL_ID: &str = "claude-haiku-4-5-cpa";
+const CLAUDE_DESKTOP_OPUS_MODEL_ID: &str = "claude-opus-5";
+const CLAUDE_DESKTOP_SONNET_MODEL_ID: &str = "claude-sonnet-5";
+const CLAUDE_DESKTOP_HAIKU_MODEL_ID: &str = "claude-haiku-4-5";
 const LEGACY_CLAUDE_DESKTOP_MODEL_IDS: [&str; 3] =
-    ["claude-opus-5", "claude-sonnet-4-6", "claude-haiku-4-5"];
+    ["claude-opus-5-cpa", "claude-sonnet-5-cpa", "claude-haiku-4-5-cpa"];
 const MANAGED_CLAUDE_OPUS_ALIAS_DISPLAY_NAME: &str = "EasyCLIProxyAPI managed Claude Opus mapping";
 const MANAGED_CLAUDE_SONNET_ALIAS_DISPLAY_NAME: &str =
     "EasyCLIProxyAPI managed Claude Sonnet mapping";
@@ -1385,7 +1386,7 @@ struct ThinkingAliasSource {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ThinkingAliasSourceLocation {
     Oauth {
-        channel: &'static str,
+        channel: String,
         force_mapping: bool,
     },
     ConfigModel {
@@ -2541,6 +2542,11 @@ struct GithubAsset {
 
 fn main() {
     let helper_args = env::args_os().collect::<Vec<_>>();
+    if helper_args.get(1).is_some_and(|arg| arg == "--cpa-acp-tools") {
+        let result = acp::run_mcp_helper();
+        if let Err(error) = result { eprintln!("{error}"); std::process::exit(1); }
+        return;
+    }
     if helper_args.get(1).is_some_and(|a| a == "--cpa-copilot-cli") {
         let code = run_copilot_helper(&helper_args).unwrap_or_else(|error| { eprintln!("{error}"); 1 });
         std::process::exit(code);
@@ -2630,6 +2636,7 @@ fn main() {
                 .build(),
         )
         .manage(CoreDownloadState::default())
+        .manage(acp::AcpState::default())
         .manage(AppUpdateState::default())
         .manage(window_activity::WindowActivity::default())
         .manage(CoreProcessState::new(should_start_core_on_launch(
@@ -2895,6 +2902,9 @@ fn main() {
 
                 process_state.set_starting(false);
 
+                let acp_app = core_app.clone();
+                tauri::async_runtime::spawn(acp::restore(acp_app));
+
                 let proxy_app = core_app.clone();
                 tauri::async_runtime::spawn(async move {
                     let manager = proxy_app.state::<reverse_proxy::ReverseProxyManagerState>();
@@ -2925,6 +2935,15 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            acp::get_acp_status,
+            acp::acp_connect,
+            acp::switch_acp_account,
+            acp::add_acp_account,
+            acp::relogin_acp_account,
+            acp::cancel_acp_operation,
+            acp::select_acp_model,
+            acp::test_acp_connection,
+            acp::set_acp_upstream_enabled,
             window_activity::main_window_active,
             desktop_theme::get_linux_system_theme,
             desktop_theme::list_custom_themes,
@@ -3137,6 +3156,7 @@ fn main() {
                 return;
             }
             process_state.recovery.cancel();
+            app_handle.state::<acp::AcpState>().shutdown();
             if let Err(error) = persist_main_window_geometry(app_handle) {
                 eprintln!("Failed to save main window geometry: {error}");
             }
@@ -3156,6 +3176,7 @@ fn main() {
             });
         }
         tauri::RunEvent::Exit => {
+            app_handle.state::<acp::AcpState>().shutdown();
             #[cfg(windows)]
             webview_recovery::stop(app_handle);
             usage::stop_usage_collector(app_handle);
